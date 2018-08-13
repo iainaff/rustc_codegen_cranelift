@@ -16,6 +16,8 @@ extern "C" {
     fn puts(s: *const u8);
 }
 
+static NUM: u8 = 6 * 7;
+
 #[lang = "start"]
 fn start(_main: *const u8, i: isize, _: *const *const u8) -> isize {
     unsafe {
@@ -23,4 +25,5 @@ fn start(_main: *const u8, i: isize, _: *const *const u8) -> isize {
         puts(ptr);
     }
     42
+    //NUM as isize
 }

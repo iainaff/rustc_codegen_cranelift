@@ -6,13 +6,19 @@ use rustc_mir::interpret::{CompileTimeEvaluator, Memory};
 
 #[derive(Default)]
 pub struct ConstantCx {
-    todo_allocs: HashSet<AllocId>,
+    todo: HashSet<TodoItem>,
     done: HashSet<DataId>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+enum TodoItem {
+    Alloc(AllocId),
+    Static(DefId),
 }
 
 impl ConstantCx {
     pub fn finalize<'a, 'tcx: 'a, B: Backend>(mut self, tcx: TyCtxt<'a, 'tcx, 'tcx>, module: &mut Module<B>) {
-        println!("todo allocs: {:?}", self.todo_allocs);
+        println!("todo {:?}", self.todo);
         define_all_allocs(tcx, module, &mut self);
         println!("done {:?}", self.done);
         for data_id in self.done.drain() {
@@ -22,14 +28,33 @@ impl ConstantCx {
 }
 
 pub fn codegen_static<'a, 'tcx: 'a, B: Backend>(cx: &mut CodegenCx<'a, 'tcx, B>, def_id: DefId) {
-    unimpl!("static mono item {:?}", def_id);
+    cx.constants.todo.insert(TodoItem::Static(def_id));
 }
 
 pub fn codegen_static_ref<'a, 'tcx: 'a>(
     fx: &mut FunctionCx<'a, 'tcx>,
     static_: &Static<'tcx>,
 ) -> CPlace<'tcx> {
-    unimpl!("static place {:?} ty {:?}", static_.def_id, static_.ty);
+    let layout = fx.layout_of(fx.monomorphize(&static_.ty));
+
+    if !fx
+        .tcx
+        .sess
+        .crate_types
+        .get()
+        .contains(&CrateType::Executable)
+    {
+        // TODO: cranelift-module api seems to be used wrong,
+        // thus causing panics for some consts, so this disables it
+        return CPlace::Addr(fx.bcx.ins().iconst(types::I64, 0), layout);
+    }
+
+    let data_id = unimpl!("static place {:?} ty {:?}", static_.def_id, static_.ty);
+
+    let local_data_id = fx.module.declare_data_in_func(data_id, &mut fx.bcx.func);
+    // TODO: does global_value return a ptr of a val?
+    let global_ptr = fx.bcx.ins().global_value(types::I64, local_data_id);
+    CPlace::Addr(global_ptr, layout)
 }
 
 pub fn trans_promoted<'a, 'tcx: 'a>(
@@ -138,7 +163,7 @@ fn get_global_for_alloc_id<'a, 'tcx: 'a, B: Backend + 'a>(
     cx: &mut ConstantCx,
     alloc_id: AllocId,
 ) -> DataId {
-    cx.todo_allocs.insert(alloc_id);
+    cx.todo.insert(TodoItem::Alloc(alloc_id));
     let data_id = define_global_for_alloc_id(module, cx, alloc_id);
     data_id
 }
@@ -150,15 +175,41 @@ fn define_all_allocs<'a, 'tcx: 'a, B: Backend + 'a> (
 ) {
     let memory = Memory::<CompileTimeEvaluator>::new(tcx.at(DUMMY_SP), ());
 
-    while let Some(alloc_id) = pop_set(&mut cx.todo_allocs) {
-        let data_id = define_global_for_alloc_id(module, cx, alloc_id);
-        println!("alloc_id {} data_id {}", alloc_id, data_id);
+    while let Some(todo_item) = pop_set(&mut cx.todo) {
+        let (data_id, alloc) = match todo_item {
+            TodoItem::Alloc(alloc_id) => {
+                println!("alloc_id {}", alloc_id);
+                let data_id = define_global_for_alloc_id(module, cx, alloc_id);
+                let alloc = memory.get(alloc_id).unwrap();
+                (data_id, alloc)
+            },
+            TodoItem::Static(def_id) => {
+                println!("static {:?}", def_id);
+                let instance = ty::Instance::mono(tcx, def_id);
+                let cid = GlobalId {
+                    instance,
+                    promoted: None,
+                };
+                let static_ = tcx.const_eval(ParamEnv::reveal_all().and(cid)).unwrap();
+
+                let alloc = match static_.val {
+                    ConstValue::ByRef(alloc, n) if n.bytes() == 0 => alloc,
+                    _ => bug!("static const eval returned {:#?}", static_),
+                };
+
+                //println!("const value: {:?} allocation: {:?}", value, alloc);
+                let data_id = module
+                    .declare_data(&*tcx.symbol_name(Instance::mono(tcx, def_id)).as_str(), Linkage::Export, false)
+                    .unwrap();
+                (data_id, alloc)
+            }
+        };
+
+        println!("data_id {}", data_id);
         if cx.done.contains(&data_id) {
             continue;
         }
 
-        let alloc = memory.get(alloc_id).unwrap();
-        //let alloc = tcx.alloc_map.lock().get(alloc_id).unwrap();
         let mut data_ctx = DataContext::new();
 
         data_ctx.define(
@@ -167,7 +218,7 @@ fn define_all_allocs<'a, 'tcx: 'a, B: Backend + 'a> (
         );
 
         for &(offset, reloc) in alloc.relocations.iter() {
-            cx.todo_allocs.insert(reloc);
+            cx.todo.insert(TodoItem::Alloc(reloc));
             let data_id = define_global_for_alloc_id(module, cx, reloc);
 
             let reloc_offset = {
@@ -186,7 +237,7 @@ fn define_all_allocs<'a, 'tcx: 'a, B: Backend + 'a> (
         cx.done.insert(data_id);
     }
 
-    assert!(cx.todo_allocs.is_empty(), "{:?}", cx.todo_allocs);
+    assert!(cx.todo.is_empty(), "{:?}", cx.todo);
 }
 
 fn pop_set<T: Copy + Eq + ::std::hash::Hash>(set: &mut HashSet<T>) -> Option<T> {

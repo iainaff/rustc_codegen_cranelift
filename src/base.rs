@@ -12,14 +12,23 @@ pub fn trans_mono_item<'a, 'tcx: 'a>(
             Instance {
                 def: InstanceDef::Item(def_id),
                 substs: _,
+            } |
+            Instance {
+                def: InstanceDef::DropGlue(def_id, _),
+                substs: _,
             } => {
-                let mut mir = ::std::io::Cursor::new(Vec::new());
-                ::rustc_mir::util::write_mir_pretty(tcx, Some(def_id), &mut mir).unwrap();
-                tcx.sess.warn(&format!(
-                    "{:?}:\n\n{}",
-                    inst,
-                    String::from_utf8_lossy(&mir.into_inner())
-                ));
+                if def_id.krate == LOCAL_CRATE {
+                    let mut mir = ::std::io::Cursor::new(Vec::new());
+                    ::rustc_mir::util::write_mir_pretty(tcx, Some(def_id), &mut mir).unwrap();
+                    tcx.sess.warn(&format!(
+                        "{:?}:\n\n{}",
+                        inst,
+                        String::from_utf8_lossy(&mir.into_inner())
+                    ));
+                } else {
+                    let mir = cx.tcx.optimized_mir(def_id);
+                    tcx.sess.warn(&format!("{:?}:\n\n{:#?}", inst, mir));
+                }
 
                 let (func_id, mut func) = cx.predefine_function(inst);
 
@@ -63,10 +72,6 @@ pub fn trans_mono_item<'a, 'tcx: 'a>(
 
                 context.clear();
             }
-            Instance {
-                def: InstanceDef::DropGlue(_, _),
-                substs: _,
-            } => unimpl!("Unimplemented drop glue instance"),
             inst => unimpl!("Unimplemented instance {:?}", inst),
         },
         MonoItem::Static(def_id) => {

@@ -184,6 +184,11 @@ pub unsafe fn drop_in_place<T: ?Sized>(to_drop: *mut T) {
     drop_in_place(to_drop);
 }
 
+#[lang = "drop"]
+pub trait Drop {
+    fn drop(&mut self);
+}
+
 pub mod intrinsics {
     extern "rust-intrinsic" {
         pub fn size_of<T>() -> usize;

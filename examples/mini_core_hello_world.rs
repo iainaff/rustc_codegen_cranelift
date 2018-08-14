@@ -19,15 +19,40 @@ extern "C" {
 static mut NUM: u8 = 6 * 7;
 static NUM_REF: &'static u8 = unsafe { &NUM };
 
+//struct NoisyDrop {
+//    inner: NoisyDropInner,
+//}
+
+struct NoisyDropInner;
+
+/*impl Drop for NoisyDrop {
+    fn drop(&mut self) {
+        unsafe {
+            let (ptr, _): (*const u8, usize) = intrinsics::transmute(" \0");
+            puts(ptr);
+        }
+    }
+}*/
+
+impl Drop for NoisyDropInner {
+    fn drop(&mut self) {
+        /*unsafe {
+            let (ptr, _): (*const u8, usize) = intrinsics::transmute("World!\0");
+            puts(ptr);
+        }*/
+    }
+}
+
 #[lang = "start"]
 fn start(_main: *const u8, i: isize, _: *const *const u8) -> isize {
-    unsafe {
-        let (ptr, _): (*const u8, usize) = intrinsics::transmute("Hello!\0");
+    /*unsafe {
+        let (ptr, _): (*const u8, usize) = intrinsics::transmute("Hello\0");
         puts(ptr);
     }
 
     unsafe {
         NUM = 6 * 7 + 5;
         *NUM_REF as isize
-    }
+    }*/
+    42
 }

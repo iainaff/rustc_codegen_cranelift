@@ -305,6 +305,7 @@ impl CodegenBackend for CraneliftCodegenBackend {
 
             for func_id in defined_functions {
                 if func_id != called_func_id {
+                    println!("finalize {}", func_id);
                     module.finalize_function(func_id);
                 }
             }

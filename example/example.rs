@@ -18,7 +18,6 @@ fn bcd(b: bool, a: u8) -> u8 {
     }
 }
 
-// FIXME make calls work
 fn call() {
     abc(42);
 }
@@ -71,59 +70,63 @@ fn char_cast(c: char) -> u8 {
     c as u8
 }
 
-struct DebugTuple(());
+pub struct DebugTuple(());
 
 fn debug_tuple() -> DebugTuple {
     DebugTuple(())
 }
 
 fn size_of<T>() -> usize {
-    unsafe { intrinsics::size_of::<T>() }
+    intrinsics::size_of::<T>()
 }
 
 fn use_size_of() -> usize {
     size_of::<u64>()
 }
 
-/*unsafe fn use_copy_intrinsic(src: *const u8, dst: *mut u8) {
+unsafe fn use_copy_intrinsic(src: *const u8, dst: *mut u8) {
     intrinsics::copy::<u8>(src, dst, 1);
-}*/
-
-/*unsafe fn use_copy_intrinsic_ref(src: *const u8, dst: *mut u8) {
-    let copy2 = &copy::<u8>;
-    copy2(src, dst, 1);
-}*/
-
-const Abc: u8 = 6 * 7;
-
-fn use_const() -> u8 {
-    Abc
 }
 
-fn call_closure_3arg() {
+unsafe fn use_copy_intrinsic_ref(src: *const u8, dst: *mut u8) {
+    let copy2 = &intrinsics::copy::<u8>;
+    copy2(src, dst, 1);
+}
+
+const ABC: u8 = 6 * 7;
+
+fn use_const() -> u8 {
+    ABC
+}
+
+pub fn call_closure_3arg() {
     (|_, _, _| {})(0u8, 42u16, 0u8)
 }
 
-fn call_closure_2arg() {
+pub fn call_closure_2arg() {
     (|_, _| {})(0u8, 42u16)
 }
 
 struct IsNotEmpty;
 
 impl<'a, 'b> FnOnce<(&'a &'b [u16],)> for IsNotEmpty {
-    type Output = bool;
+    type Output = (u8, u8);
 
     #[inline]
-    extern "rust-call" fn call_once(mut self, arg: (&'a &'b [u16],)) -> bool {
+    extern "rust-call" fn call_once(mut self, arg: (&'a &'b [u16],)) -> (u8, u8) {
         self.call_mut(arg)
     }
 }
 
 impl<'a, 'b> FnMut<(&'a &'b [u16],)> for IsNotEmpty {
     #[inline]
-    extern "rust-call" fn call_mut(&mut self, arg: (&'a &'b [u16],)) -> bool {
-        true
+    extern "rust-call" fn call_mut(&mut self, _arg: (&'a &'b [u16],)) -> (u8, u8) {
+        (0, 42)
     }
+}
+
+pub fn call_is_not_empty() {
+    IsNotEmpty.call_once((&(&[0u16] as &[_]),));
 }
 
 fn eq_char(a: char, b: char) -> bool {
@@ -134,14 +137,9 @@ unsafe fn transmute(c: char) -> u32 {
     intrinsics::transmute(c)
 }
 
-unsafe fn call_uninit() -> u8 {
-    intrinsics::uninit()
-}
-
-// TODO: enable when fat pointers are supported
-/*unsafe fn deref_str_ptr(s: *const str) -> &'static str {
+unsafe fn deref_str_ptr(s: *const str) -> &'static str {
     &*s
-}*/
+}
 
 fn use_array(arr: [u8; 3]) -> u8 {
     arr[1]
@@ -149,6 +147,10 @@ fn use_array(arr: [u8; 3]) -> u8 {
 
 fn repeat_array() -> [u8; 3] {
     [0; 3]
+}
+
+fn array_as_slice(arr: &[u8; 3]) -> &[u8] {
+    arr
 }
 
 unsafe fn use_ctlz_nonzero(a: u16) -> u16 {
@@ -173,4 +175,34 @@ fn make_array() -> [u8; 3] {
 
 fn some_promoted_tuple() -> &'static (&'static str, &'static str) {
     &("abc", "some")
+}
+
+fn index_slice(s: &[u8]) -> u8 {
+    s[2]
+}
+
+pub struct StrWrapper {
+    s: str,
+}
+
+fn str_wrapper_get(w: &StrWrapper) -> &str {
+    &w.s
+}
+
+fn i16_as_i8(a: i16) -> i8 {
+    a as i8
+}
+
+struct Unsized(u8, str);
+
+fn get_sized_field_ref_from_unsized_type(u: &Unsized) -> &u8 {
+    &u.0
+}
+
+fn get_unsized_field_ref_from_unsized_type(u: &Unsized) -> &str {
+    &u.1
+}
+
+pub fn reuse_byref_argument_storage(a: (u8, u16, u32)) -> u8 {
+    a.0
 }

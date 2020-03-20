@@ -1,5 +1,3 @@
-cargo-features = ["edition"]
-
 [package]
 name = "rustc_codegen_cranelift"
 version = "0.1.0"
@@ -10,24 +8,72 @@ edition = "2018"
 crate-type = ["dylib"]
 
 [dependencies]
-#cranelift = "0.14.0"
-#cranelift-module = "0.14.0"
-#cranelift-simplejit = "0.14.0"
-#cranelift-faerie = "0.14.0"
+# These have to be in sync with each other
+cranelift-codegen = { git = "https://github.com/bytecodealliance/wasmtime/" }
+cranelift-frontend = { git = "https://github.com/bytecodealliance/wasmtime/" }
+cranelift-module = { git = "https://github.com/bytecodealliance/wasmtime/" }
+cranelift-object = { git = "https://github.com/bytecodealliance/wasmtime/" }
+target-lexicon = "0.10.0"
 
-cranelift = { git = "https://github.com/CraneStation/cranelift.git" }
-cranelift-module = { git = "https://github.com/CraneStation/cranelift.git" }
-cranelift-simplejit = { git = "https://github.com/CraneStation/cranelift.git" }
-cranelift-faerie = { git = "https://github.com/CraneStation/cranelift.git" }
-target-lexicon = "0.0.3"
-#goblin = "0.0.17"
-faerie = "0.4.4"
-ar = "0.6.0"
-bitflags = "1.0.3"
+ar = "0.8.0"
+byteorder = "1.2.7"
+indexmap = "1.0.2"
+
+[dependencies.object]
+version = "0.17.0"
+default-features = false
+features = ["read", "std", "write"] # We don't need WASM support
+
+[dependencies.gimli]
+version = "0.20.0"
+default-features = false
+features = ["write"] # We don't need read support
 
 # Uncomment to use local checkout of cranelift
-#[patch."https://github.com/CraneStation/cranelift.git"]
-#cranelift = { path = "../cranelift/lib/umbrella" }
-#cranelift-module = { path = "../cranelift/lib/module" }
-#cranelift-simplejit = { path = "../cranelift/lib/simplejit" }
-#cranelift-faerie = { path = "../cranelift/lib/faerie" }
+#[patch."https://github.com/bytecodealliance/wasmtime/"]
+#cranelift-codegen = { path = "../wasmtime/cranelift/codegen" }
+#cranelift-frontend = { path = "../wasmtime/cranelift/frontend" }
+#cranelift-module = { path = "../wasmtime/cranelift/module" }
+#cranelift-simplejit = { path = "../wasmtime/cranelift/simplejit" }
+#cranelift-object = { path = "../wasmtime/cranelift/object" }
+
+#[patch.crates-io]
+#gimli = { path = "../" }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+cranelift-simplejit = { git = "https://github.com/bytecodealliance/wasmtime/" }
+libloading = "0.5.1"
+
+[profile.dev]
+# By compiling dependencies with optimizations, performing tests gets much faster.
+opt-level = 3
+
+[profile.dev.package.rustc_codegen_cranelift]
+# Disabling optimizations for cg_clif itself makes compilation after a change faster.
+opt-level = 0
+
+# Disable optimizations and debuginfo of build scripts and some of the heavy build deps, as the
+# execution time of build scripts is so fast that optimizing them slows down the total build time.
+[profile.dev.build-override]
+opt-level = 0
+debug = false
+
+[profile.release.build-override]
+opt-level = 0
+debug = false
+
+[profile.dev.package.cranelift-codegen-meta]
+opt-level = 0
+debug = false
+
+[profile.release.package.cranelift-codegen-meta]
+opt-level = 0
+debug = false
+
+[profile.dev.package.syn]
+opt-level = 0
+debug = false
+
+[profile.release.package.syn]
+opt-level = 0
+debug = false

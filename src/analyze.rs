@@ -1,41 +1,45 @@
 use crate::prelude::*;
 
 use rustc::mir::StatementKind::*;
+use rustc_index::vec::IndexVec;
 
-bitflags! {
-    pub struct Flags: u8 {
-        const NOT_SSA = 0b00000001;
-    }
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum SsaKind {
+    NotSsa,
+    Ssa,
 }
 
-pub fn analyze<'a, 'tcx: 'a>(fx: &FunctionCx<'a, 'tcx, impl Backend>) -> HashMap<Local, Flags> {
-    let mut flag_map = HashMap::new();
-
-    for local in fx.mir.local_decls.indices() {
-        flag_map.insert(local, Flags::empty());
-    }
-
-    not_ssa(&mut flag_map, RETURN_PLACE);
-
-    for (local, local_decl) in fx.mir.local_decls.iter_enumerated() {
-        if fx.cton_type(local_decl.ty).is_none() {
-            not_ssa(&mut flag_map, local);
+pub fn analyze(fx: &FunctionCx<'_, '_, impl Backend>) -> IndexVec<Local, SsaKind> {
+    let mut flag_map = fx.mir.local_decls.iter().map(|local_decl| {
+        if fx.clif_type(fx.monomorphize(&local_decl.ty)).is_some() {
+            SsaKind::Ssa
+        } else {
+            SsaKind::NotSsa
         }
-    }
+    }).collect::<IndexVec<Local, SsaKind>>();
 
     for bb in fx.mir.basic_blocks().iter() {
         for stmt in bb.statements.iter() {
             match &stmt.kind {
-                Assign(_, Rvalue::Ref(_, _, place)) => analyze_non_ssa_place(&mut flag_map, place),
+                Assign(place_and_rval) => match &place_and_rval.1 {
+                    Rvalue::Ref(_, _, place) => {
+                        not_ssa(&mut flag_map, place.local)
+                    }
+                    _ => {}
+                },
                 _ => {}
             }
         }
 
         match &bb.terminator().kind {
-            TerminatorKind::Call {
-                destination: Some((place, _)),
-                ..
-            } => analyze_non_ssa_place(&mut flag_map, place),
+            TerminatorKind::Call { destination, .. } => {
+                if let Some((dest_place, _dest_bb)) = destination {
+                    let dest_layout = fx.layout_of(fx.monomorphize(&dest_place.ty(&fx.mir.local_decls, fx.tcx).ty));
+                    if !crate::abi::can_return_to_ssa_var(fx.tcx, dest_layout) {
+                        not_ssa(&mut flag_map, dest_place.local)
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -43,13 +47,6 @@ pub fn analyze<'a, 'tcx: 'a>(fx: &FunctionCx<'a, 'tcx, impl Backend>) -> HashMap
     flag_map
 }
 
-fn analyze_non_ssa_place(flag_map: &mut HashMap<Local, Flags>, place: &Place) {
-    match place {
-        Place::Local(local) => not_ssa(flag_map, local),
-        _ => {}
-    }
-}
-
-fn not_ssa<L: ::std::borrow::Borrow<Local>>(flag_map: &mut HashMap<Local, Flags>, local: L) {
-    *flag_map.get_mut(local.borrow()).unwrap() |= Flags::NOT_SSA;
+fn not_ssa(flag_map: &mut IndexVec<Local, SsaKind>, local: Local) {
+    flag_map[local] = SsaKind::NotSsa;
 }

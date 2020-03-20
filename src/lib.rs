@@ -1,460 +1,323 @@
-#![feature(rustc_private, macro_at_most_once_rep, iterator_find_map)]
+#![feature(rustc_private, decl_macro, type_alias_impl_trait, associated_type_bounds, never_type)]
 #![allow(intra_doc_link_resolution_failure)]
 
-extern crate syntax;
-#[macro_use]
+extern crate flate2;
+extern crate libc;
+extern crate tempfile;
 extern crate rustc;
+extern crate rustc_codegen_ssa;
 extern crate rustc_codegen_utils;
-extern crate rustc_incremental;
-extern crate rustc_mir;
-extern crate rustc_target;
-#[macro_use]
 extern crate rustc_data_structures;
-
-extern crate ar;
-#[macro_use]
-extern crate bitflags;
-extern crate faerie;
-//extern crate goblin;
-extern crate cranelift;
-extern crate cranelift_faerie;
-extern crate cranelift_module;
-extern crate cranelift_simplejit;
-extern crate target_lexicon;
+extern crate rustc_driver;
+extern crate rustc_fs_util;
+extern crate rustc_hir;
+extern crate rustc_incremental;
+extern crate rustc_index;
+extern crate rustc_mir;
+extern crate rustc_session;
+extern crate rustc_span;
+extern crate rustc_target;
+extern crate rustc_ast;
 
 use std::any::Any;
-use std::fs::File;
-use std::path::Path;
-use std::sync::{mpsc, Arc};
 
-use rustc::dep_graph::DepGraph;
-use rustc::middle::cstore::MetadataLoader;
-use rustc::session::{config::OutputFilenames, CompileIncomplete};
+use rustc::dep_graph::{DepGraph, WorkProduct, WorkProductId};
+use rustc::middle::cstore::{EncodedMetadata, MetadataLoader};
+use rustc::session::config::OutputFilenames;
 use rustc::ty::query::Providers;
+use rustc::util::common::ErrorReported;
 use rustc_codegen_utils::codegen_backend::CodegenBackend;
-use rustc_codegen_utils::link::{build_link_meta, out_filename};
-use rustc_data_structures::owning_ref::{self, OwningRef};
-use rustc_data_structures::svh::Svh;
-use syntax::symbol::Symbol;
 
-use cranelift::codegen::settings;
-use cranelift_faerie::*;
-
-struct NonFatal(pub String);
-
-macro_rules! unimpl {
-    ($($tt:tt)*) => {
-        panic!(::NonFatal(format!($($tt)*)));
-    };
-}
-
-macro_rules! each_module {
-    ($cx:expr, |$p:pat| $res:expr) => {
-        ModuleTup {
-            jit: $cx.jit.as_mut().map(|$p| $res),
-            faerie: $cx.faerie.as_mut().map(|$p| $res),
-        }
-    };
-}
-
-mod abi;
-mod analyze;
-mod base;
-mod common;
-mod constant;
-mod pretty_clif;
-
-mod prelude {
-    pub use std::any::Any;
-    pub use std::collections::{HashMap, HashSet};
-
-    pub use rustc::hir::def_id::{DefId, LOCAL_CRATE};
-    pub use rustc::mir;
-    pub use rustc::mir::interpret::AllocId;
-    pub use rustc::mir::*;
-    pub use rustc::session::{config::CrateType, Session};
-    pub use rustc::ty::layout::{self, LayoutOf, Size, TyLayout};
-    pub use rustc::ty::{
-        self, subst::Substs, FnSig, Instance, InstanceDef, ParamEnv, PolyFnSig, Ty, TyCtxt,
-        TypeAndMut, TypeFoldable, TypeVariants,
-    };
-    pub use rustc_data_structures::{fx::FxHashMap, indexed_vec::Idx, sync::Lrc};
-    pub use rustc_mir::monomorphize::{collector, MonoItem};
-    pub use syntax::ast::{FloatTy, IntTy, UintTy};
-    pub use syntax::codemap::DUMMY_SP;
-
-    pub use cranelift::codegen::ir::{
-        condcodes::IntCC, function::Function, ExternalName, FuncRef, Inst, StackSlot,
-    };
-    pub use cranelift::codegen::Context;
-    pub use cranelift::prelude::*;
-    pub use cranelift_module::{
-        Backend, DataContext, DataId, FuncId, Linkage, Module, Writability,
-    };
-    pub use cranelift_simplejit::{SimpleJITBackend, SimpleJITBuilder};
-
-    pub use crate::abi::*;
-    pub use crate::base::{trans_operand, trans_place};
-    pub use crate::common::Variable;
-    pub use crate::common::*;
-
-    pub use crate::{CodegenCx, ModuleTup};
-
-    pub fn should_codegen(sess: &Session) -> bool {
-        ::std::env::var("SHOULD_CODEGEN").is_ok()
-            || sess.crate_types.get().contains(&CrateType::Executable)
-    }
-}
+use cranelift_codegen::settings;
 
 use crate::constant::ConstantCx;
 use crate::prelude::*;
 
-pub struct CodegenCx<'a, 'tcx: 'a> {
-    pub tcx: TyCtxt<'a, 'tcx, 'tcx>,
-    pub jit: Option<(ConstantCx, &'a mut Module<SimpleJITBackend>)>,
-    pub faerie: Option<(ConstantCx, &'a mut Module<FaerieBackend>)>,
-    pub defined_functions: Vec<FuncId>,
+mod abi;
+mod allocator;
+mod analyze;
+mod archive;
+mod atomic_shim;
+mod base;
+mod backend;
+mod cast;
+mod codegen_i128;
+mod common;
+mod constant;
+mod debuginfo;
+mod discriminant;
+mod driver;
+mod intrinsics;
+mod linkage;
+mod main_shim;
+mod metadata;
+mod num;
+mod optimize;
+mod pointer;
+mod pretty_clif;
+mod target_features_whitelist;
+mod trap;
+mod unsize;
+mod value_and_place;
+mod vtable;
 
-    // Cache
-    pub context: Context,
-}
+mod prelude {
+    pub use std::any::Any;
+    pub use std::collections::{HashMap, HashSet};
+    pub use std::convert::{TryFrom, TryInto};
 
-pub struct ModuleTup<T> {
-    jit: Option<T>,
-    #[allow(dead_code)]
-    faerie: Option<T>,
-}
+    pub use rustc_ast::ast::{FloatTy, IntTy, UintTy};
+    pub use rustc_span::{Pos, Span};
 
-struct CraneliftMetadataLoader;
+    pub use rustc::bug;
+    pub use rustc_hir::def_id::{CrateNum, DefId, LOCAL_CRATE};
+    pub use rustc::mir::{self, interpret::AllocId, mono::MonoItem, *};
+    pub use rustc::session::{
+        config::{CrateType, Lto},
+        Session,
+    };
+    pub use rustc::ty::layout::{self, Abi, LayoutOf, Scalar, Size, TyLayout, VariantIdx};
+    pub use rustc::ty::{
+        self, FnSig, Instance, InstanceDef, ParamEnv, PolyFnSig, Ty, TyCtxt, TypeAndMut,
+        TypeFoldable,
+    };
 
-impl MetadataLoader for CraneliftMetadataLoader {
-    fn get_rlib_metadata(
-        &self,
-        _target: &rustc_target::spec::Target,
-        path: &Path,
-    ) -> Result<owning_ref::ErasedBoxRef<[u8]>, String> {
-        let mut archive = ar::Archive::new(File::open(path).map_err(|e| format!("{:?}", e))?);
-        // Iterate over all entries in the archive:
-        while let Some(entry_result) = archive.next_entry() {
-            let mut entry = entry_result.map_err(|e| format!("{:?}", e))?;
-            if entry.header().identifier().starts_with(b".rustc.clif_metadata") {
-                let mut buf = Vec::new();
-                ::std::io::copy(&mut entry, &mut buf).map_err(|e| format!("{:?}", e))?;
-                let buf: OwningRef<Vec<u8>, [u8]> = OwningRef::new(buf).into();
-                return Ok(rustc_erase_owner!(buf.map_owner_box()));
+    pub use rustc_data_structures::{
+        fx::{FxHashMap, FxHashSet},
+        sync::Lrc,
+    };
+
+    pub use rustc_index::vec::Idx;
+
+    pub use rustc_codegen_ssa::mir::operand::{OperandRef, OperandValue};
+    pub use rustc_codegen_ssa::traits::*;
+    pub use rustc_codegen_ssa::{CodegenResults, CompiledModule, ModuleKind};
+
+    pub use cranelift_codegen::Context;
+    pub use cranelift_codegen::entity::EntitySet;
+    pub use cranelift_codegen::ir::{AbiParam, Block, ExternalName, FuncRef, Inst, InstBuilder, MemFlags, Signature, SourceLoc, StackSlot, StackSlotData, StackSlotKind, TrapCode, Type, Value};
+    pub use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+    pub use cranelift_codegen::ir::function::Function;
+    pub use cranelift_codegen::ir::immediates::{Ieee32, Ieee64};
+    pub use cranelift_codegen::ir::types;
+    pub use cranelift_codegen::isa::{self, CallConv};
+    pub use cranelift_codegen::settings::{self, Configurable};
+    pub use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
+    pub use cranelift_module::{
+        self, Backend, DataContext, DataId, FuncId, FuncOrDataId, Linkage, Module,
+    };
+
+    pub use crate::abi::*;
+    pub use crate::base::{trans_operand, trans_place};
+    pub use crate::cast::*;
+    pub use crate::common::*;
+    pub use crate::debuginfo::{DebugContext, FunctionDebugContext};
+    pub use crate::pointer::Pointer;
+    pub use crate::trap::*;
+    pub use crate::value_and_place::{CPlace, CPlaceInner, CValue};
+    pub use crate::CodegenCx;
+
+    pub struct PrintOnPanic<F: Fn() -> String>(pub F);
+    impl<F: Fn() -> String> Drop for PrintOnPanic<F> {
+        fn drop(&mut self) {
+            if ::std::thread::panicking() {
+                println!("{}", (self.0)());
             }
         }
-
-        Err("couldn't find metadata entry".to_string())
-        //self.get_dylib_metadata(target, path)
     }
 
-    fn get_dylib_metadata(
-        &self,
-        _target: &rustc_target::spec::Target,
-        _path: &Path,
-    ) -> Result<owning_ref::ErasedBoxRef<[u8]>, String> {
-        //use goblin::Object;
+    pub macro unimpl_fatal($tcx:expr, $span:expr, $($tt:tt)*) {
+        $tcx.sess.span_fatal($span, &format!($($tt)*));
+    }
+}
 
-        //let buffer = ::std::fs::read(path).map_err(|e|format!("{:?}", e))?;
-        /*match Object::parse(&buffer).map_err(|e|format!("{:?}", e))? {
-            Object::Elf(elf) => {
-                println!("elf: {:#?}", &elf);
-            },
-            Object::PE(pe) => {
-                println!("pe: {:#?}", &pe);
-            },
-            Object::Mach(mach) => {
-                println!("mach: {:#?}", &mach);
-            },
-            Object::Archive(archive) => {
-                return Err(format!("archive: {:#?}", &archive));
-            },
-            Object::Unknown(magic) => {
-                return Err(format!("unknown magic: {:#x}", magic))
-            }
-        }*/
-        Err("dylib metadata loading is not yet supported".to_string())
+pub struct CodegenCx<'clif, 'tcx, B: Backend + 'static> {
+    tcx: TyCtxt<'tcx>,
+    module: &'clif mut Module<B>,
+    constants_cx: ConstantCx,
+    cached_context: Context,
+    vtables: HashMap<(Ty<'tcx>, Option<ty::PolyExistentialTraitRef<'tcx>>), DataId>,
+    debug_context: Option<&'clif mut DebugContext<'tcx>>,
+}
+
+impl<'clif, 'tcx, B: Backend + 'static> CodegenCx<'clif, 'tcx, B> {
+    fn new(
+        tcx: TyCtxt<'tcx>,
+        module: &'clif mut Module<B>,
+        debug_context: Option<&'clif mut DebugContext<'tcx>>,
+    ) -> Self {
+        CodegenCx {
+            tcx,
+            module,
+            constants_cx: ConstantCx::default(),
+            cached_context: Context::new(),
+            vtables: HashMap::new(),
+            debug_context,
+        }
+    }
+
+    fn finalize(self) {
+        self.constants_cx.finalize(self.tcx, self.module);
     }
 }
 
 struct CraneliftCodegenBackend;
 
-struct OngoingCodegen {
-    product: cranelift_faerie::FaerieProduct,
-    metadata: Vec<u8>,
-    crate_name: Symbol,
-    crate_hash: Svh,
-}
-
 impl CodegenBackend for CraneliftCodegenBackend {
     fn init(&self, sess: &Session) {
-        for cty in sess.opts.crate_types.iter() {
-            match *cty {
-                CrateType::Rlib | CrateType::Dylib | CrateType::Executable => {}
-                _ => {
-                    sess.err(&format!(
-                        "Rustc codegen cranelift doesn't support output type {}",
-                        cty
-                    ));
-                }
-            }
+        if sess.lto() != rustc_session::config::Lto::No {
+            sess.warn("LTO is not supported. You may get a linker error.");
         }
     }
 
-    fn metadata_loader(&self) -> Box<MetadataLoader + Sync> {
-        Box::new(CraneliftMetadataLoader)
+    fn metadata_loader(&self) -> Box<dyn MetadataLoader + Sync> {
+        Box::new(crate::metadata::CraneliftMetadataLoader)
     }
 
     fn provide(&self, providers: &mut Providers) {
-        rustc_codegen_utils::symbol_names::provide(providers);
-
-        providers.target_features_whitelist = |_tcx, _cnum| Lrc::new(Default::default());
-        providers.is_reachable_non_generic = |_tcx, _defid| true;
-        providers.exported_symbols = |_tcx, _crate| Arc::new(Vec::new());
-        providers.upstream_monomorphizations = |_tcx, _cnum| Lrc::new(FxHashMap());
-        providers.upstream_monomorphizations_for = |tcx, def_id| {
-            debug_assert!(!def_id.is_local());
-            tcx.upstream_monomorphizations(LOCAL_CRATE)
-                .get(&def_id)
-                .cloned()
+        providers.target_features_whitelist = |tcx, cnum| {
+            assert_eq!(cnum, LOCAL_CRATE);
+            if tcx.sess.opts.actually_rustdoc {
+                // rustdoc needs to be able to document functions that use all the features, so
+                // whitelist them all
+                tcx.arena.alloc(
+                    target_features_whitelist::all_known_features()
+                        .map(|(a, b)| (a.to_string(), b))
+                        .collect(),
+                )
+            } else {
+                tcx.arena.alloc(
+                    target_features_whitelist::target_feature_whitelist(tcx.sess)
+                        .iter()
+                        .map(|&(a, b)| (a.to_string(), b))
+                        .collect(),
+                )
+            }
         };
     }
-    fn provide_extern(&self, providers: &mut Providers) {
-        providers.is_reachable_non_generic = |_tcx, _defid| true;
-    }
+    fn provide_extern(&self, _providers: &mut Providers) {}
 
-    fn codegen_crate<'a, 'tcx>(
+    fn codegen_crate<'tcx>(
         &self,
-        tcx: TyCtxt<'a, 'tcx, 'tcx>,
-        _rx: mpsc::Receiver<Box<Any + Send>>,
-    ) -> Box<Any> {
-        use rustc_mir::monomorphize::item::MonoItem;
-
+        tcx: TyCtxt<'tcx>,
+        metadata: EncodedMetadata,
+        need_metadata_module: bool,
+    ) -> Box<dyn Any> {
         rustc_codegen_utils::check_for_rustc_errors_attr(tcx);
-        rustc_codegen_utils::symbol_names_test::report_symbol_names(tcx);
-        rustc_incremental::assert_dep_graph(tcx);
+
+        let res = driver::codegen_crate(tcx, metadata, need_metadata_module);
+
         rustc_incremental::assert_module_sources::assert_module_sources(tcx);
-        rustc_mir::monomorphize::assert_symbols_are_distinct(
-            tcx,
-            collector::collect_crate_mono_items(tcx, collector::MonoItemCollectionMode::Eager)
-                .0
-                .iter(),
-        );
-        //::rustc::middle::dependency_format::calculate(tcx);
-        let _ = tcx.link_args(LOCAL_CRATE);
-        let _ = tcx.native_libraries(LOCAL_CRATE);
-        for mono_item in
-            collector::collect_crate_mono_items(tcx, collector::MonoItemCollectionMode::Eager).0
-        {
-            match mono_item {
-                MonoItem::Fn(inst) => {
-                    let def_id = inst.def_id();
-                    if def_id.is_local() {
-                        let _ = inst.def.is_inline(tcx);
-                        let _ = tcx.codegen_fn_attrs(def_id);
-                    }
-                }
-                _ => {}
-            }
-        }
+        rustc_codegen_utils::symbol_names_test::report_symbol_names(tcx);
 
-        if !tcx.sess.crate_types.get().contains(&CrateType::Executable)
-            && std::env::var("SHOULD_RUN").is_ok()
-        {
-            tcx.sess
-                .err("Can't JIT run non executable (SHOULD_RUN env var is set)");
-        }
-
-        tcx.sess.abort_if_errors();
-
-        let link_meta = ::build_link_meta(tcx.crate_hash(LOCAL_CRATE));
-        let metadata = tcx.encode_metadata(&link_meta);
-
-        let mut flags_builder = settings::builder();
-        flags_builder.enable("is_pic").unwrap();
-        let flags = settings::Flags::new(flags_builder);
-        let isa = cranelift::codegen::isa::lookup(target_lexicon::Triple::host())
-            .unwrap()
-            .finish(flags);
-        let mut jit_module: Module<SimpleJITBackend> = Module::new(SimpleJITBuilder::new());
-        let mut faerie_module: Module<FaerieBackend> = Module::new(
-            FaerieBuilder::new(
-                isa,
-                "some_file.o".to_string(),
-                FaerieTrapCollection::Disabled,
-                FaerieBuilder::default_libcall_names(),
-            ).unwrap(),
-        );
-
-        let defined_functions = {
-            use std::io::Write;
-            let mut cx = CodegenCx {
-                tcx,
-                jit: Some((ConstantCx::default(), &mut jit_module)),
-                faerie: Some((ConstantCx::default(), &mut faerie_module)),
-                defined_functions: Vec::new(),
-
-                context: Context::new(),
-            };
-
-            let mut log = ::std::fs::File::create("log.txt").unwrap();
-
-            let before = ::std::time::Instant::now();
-            let mono_items =
-                collector::collect_crate_mono_items(tcx, collector::MonoItemCollectionMode::Eager)
-                    .0;
-
-            // TODO: move to the end of this function when compiling libcore doesn't have unimplemented stuff anymore
-            save_incremental(tcx);
-            tcx.sess.warn("Saved incremental data");
-
-            for mono_item in mono_items {
-                let cx = &mut cx;
-                let res = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(move || {
-                    base::trans_mono_item(cx, mono_item);
-                }));
-                if let Err(err) = res {
-                    match err.downcast::<NonFatal>() {
-                        Ok(non_fatal) => {
-                            writeln!(log, "{}", &non_fatal.0);
-                            tcx.sess.err(&non_fatal.0)
-                        }
-                        Err(err) => ::std::panic::resume_unwind(err),
-                    }
-                }
-            }
-
-            match cx {
-                CodegenCx {
-                    tcx,
-                    jit,
-                    faerie,
-                    defined_functions: _,
-                    context: _,
-                } => {
-                    jit.map(|jit| jit.0.finalize(tcx, jit.1));
-                    faerie.map(|faerie| faerie.0.finalize(tcx, faerie.1));
-                }
-            }
-
-            let after = ::std::time::Instant::now();
-            println!("time: {:?}", after - before);
-
-            cx.defined_functions
-        };
-
-        tcx.sess.abort_if_errors();
-
-        tcx.sess.warn("Compiled everything");
-
-        // TODO: this doesn't work most of the time
-        if std::env::var("SHOULD_RUN").is_ok() {
-            tcx.sess.warn("Rustc codegen cranelift will JIT run the executable, because the SHOULD_RUN env var is set");
-            let start_wrapper = tcx.lang_items().start_fn().expect("no start lang item");
-
-            let (name, sig) =
-                crate::abi::get_function_name_and_sig(tcx, Instance::mono(tcx, start_wrapper));
-            let called_func_id = jit_module
-                .declare_function(&name, Linkage::Import, &sig)
-                .unwrap();
-
-            for func_id in defined_functions {
-                if func_id != called_func_id {
-                    jit_module.finalize_function(func_id);
-                }
-            }
-            tcx.sess.warn("Finalized everything");
-
-            let finalized_function: *const u8 = jit_module.finalize_function(called_func_id);
-            let f: extern "C" fn(*const u8, isize, *const *const u8) -> isize =
-                unsafe { ::std::mem::transmute(finalized_function) };
-            let res = f(0 as *const u8, 0, 0 as *const _);
-            tcx.sess.warn(&format!("main returned {}", res));
-
-            jit_module.finish();
-            ::std::process::exit(0);
-        } else if should_codegen(tcx.sess) {
-            jit_module.finalize_all();
-            faerie_module.finalize_all();
-
-            tcx.sess.warn("Finalized everything");
-        }
-
-        Box::new(OngoingCodegen {
-            product: faerie_module.finish(),
-            metadata: metadata.raw_data,
-            crate_name: tcx.crate_name(LOCAL_CRATE),
-            crate_hash: tcx.crate_hash(LOCAL_CRATE),
-        })
+        res
     }
 
-    fn join_codegen_and_link(
+    fn join_codegen(
         &self,
-        ongoing_codegen: Box<Any>,
+        ongoing_codegen: Box<dyn Any>,
         sess: &Session,
-        _dep_graph: &DepGraph,
+        dep_graph: &DepGraph,
+    ) -> Result<Box<dyn Any>, ErrorReported> {
+        let (codegen_results, work_products) = *ongoing_codegen.downcast::<(CodegenResults, FxHashMap<WorkProductId, WorkProduct>)>().unwrap();
+
+        sess.time("serialize_work_products", move || {
+            rustc_incremental::save_work_product_index(sess, &dep_graph, work_products)
+        });
+
+        Ok(Box::new(codegen_results))
+    }
+
+    fn link(
+        &self,
+        sess: &Session,
+        res: Box<dyn Any>,
         outputs: &OutputFilenames,
-    ) -> Result<(), CompileIncomplete> {
-        let ongoing_codegen = *ongoing_codegen
-            .downcast::<OngoingCodegen>()
-            .expect("Expected CraneliftCodegenBackend's OngoingCodegen, found Box<Any>");
+    ) -> Result<(), ErrorReported> {
+        use rustc_codegen_ssa::back::link::link_binary;
 
-        let mut artifact = ongoing_codegen.product.artifact;
-        let metadata = ongoing_codegen.metadata;
+        let codegen_results = *res
+            .downcast::<CodegenResults>()
+            .expect("Expected CraneliftCodegenBackend's CodegenResult, found Box<Any>");
 
-        let metadata_name = ".rustc.clif_metadata".to_string() + &ongoing_codegen.crate_hash.to_string();
-        artifact
-            .declare_with(
-                &metadata_name,
-                faerie::artifact::Decl::Data {
-                    global: true,
-                    writeable: false,
-                },
-                metadata.clone(),
-            ).unwrap();
+        let _timer = sess.prof.generic_activity("link_crate");
 
-        for &crate_type in sess.opts.crate_types.iter() {
-            match crate_type {
-                // TODO: link executable
-                CrateType::Executable | CrateType::Rlib => {
-                    let output_name = out_filename(
-                        sess,
-                        crate_type,
-                        &outputs,
-                        &ongoing_codegen.crate_name.as_str(),
-                    );
-                    let file = File::create(&output_name).unwrap();
-                    let mut builder = ar::Builder::new(file);
-                    builder
-                        .append(
-                            &ar::Header::new(metadata_name.as_bytes().to_vec(), metadata.len() as u64),
-                            ::std::io::Cursor::new(metadata.clone()),
-                        ).unwrap();
-                    if should_codegen(sess) {
-                        let obj = artifact.emit().unwrap();
-                        builder
-                            .append(
-                                &ar::Header::new(b"data.o".to_vec(), obj.len() as u64),
-                                ::std::io::Cursor::new(obj),
-                            ).unwrap();
-                    }
-                }
-                _ => sess.fatal(&format!("Unsupported crate type: {:?}", crate_type)),
-            }
-        }
+        sess.time("linking", || {
+            let target_cpu = crate::target_triple(sess).to_string();
+            link_binary::<crate::archive::ArArchiveBuilder<'_>>(
+                sess,
+                &codegen_results,
+                outputs,
+                &codegen_results.crate_name.as_str(),
+                &target_cpu,
+            );
+        });
+
+        rustc_incremental::finalize_session_directory(sess, codegen_results.crate_hash);
+
         Ok(())
     }
 }
 
-fn save_incremental<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
-    rustc_incremental::assert_dep_graph(tcx);
-    rustc_incremental::save_dep_graph(tcx);
-    rustc_incremental::finalize_session_directory(tcx.sess, tcx.crate_hash(LOCAL_CRATE));
+fn target_triple(sess: &Session) -> target_lexicon::Triple {
+    sess.target.target.llvm_target.parse().unwrap()
+}
+
+fn build_isa(sess: &Session, enable_pic: bool) -> Box<dyn isa::TargetIsa + 'static> {
+    use target_lexicon::BinaryFormat;
+
+    let target_triple = crate::target_triple(sess);
+
+    let mut flags_builder = settings::builder();
+    if enable_pic {
+        flags_builder.enable("is_pic").unwrap();
+    } else {
+        flags_builder.set("is_pic", "false").unwrap();
+    }
+    flags_builder.set("enable_probestack", "false").unwrap(); // __cranelift_probestack is not provided
+    flags_builder
+        .set(
+            "enable_verifier",
+            if cfg!(debug_assertions) {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .unwrap();
+
+    let tls_model = match target_triple.binary_format {
+        BinaryFormat::Elf => "elf_gd",
+        BinaryFormat::Macho => "macho",
+        BinaryFormat::Coff => "coff",
+        _ => "none",
+    };
+    flags_builder.set("tls_model", tls_model).unwrap();
+
+    // FIXME(CraneStation/cranelift#732) fix LICM in presence of jump tables
+    /*
+    use rustc::session::config::OptLevel;
+    match sess.opts.optimize {
+        OptLevel::No => {
+            flags_builder.set("opt_level", "fastest").unwrap();
+        }
+        OptLevel::Less | OptLevel::Default => {}
+        OptLevel::Aggressive => {
+            flags_builder.set("opt_level", "best").unwrap();
+        }
+        OptLevel::Size | OptLevel::SizeMin => {
+            sess.warn("Optimizing for size is not supported. Just ignoring the request");
+        }
+    }*/
+
+    let flags = settings::Flags::new(flags_builder);
+    cranelift_codegen::isa::lookup(target_triple)
+        .unwrap()
+        .finish(flags)
 }
 
 /// This is the entrypoint for a hot plugged rustc_codegen_cranelift
 #[no_mangle]
-pub fn __rustc_codegen_backend() -> Box<CodegenBackend> {
+pub fn __rustc_codegen_backend() -> Box<dyn CodegenBackend> {
     Box::new(CraneliftCodegenBackend)
 }

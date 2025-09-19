@@ -1,25 +1,33 @@
+//! Annotate the clif ir with comments describing how arguments are passed into the current function
+//! and where all locals are stored.
+
 use std::borrow::Cow;
 
-use rustc::mir;
+use rustc_target::callconv::PassMode;
 
-use crate::abi::pass_mode::*;
 use crate::prelude::*;
 
-pub fn add_args_header_comment(fx: &mut FunctionCx<impl Backend>) {
-    fx.add_global_comment(format!(
-        "kind  loc.idx   param    pass mode                            ty"
-    ));
+pub(super) fn add_args_header_comment(fx: &mut FunctionCx<'_, '_, '_>) {
+    if fx.clif_comments.enabled() {
+        fx.add_global_comment(
+            "kind  loc.idx   param    pass mode                            ty".to_string(),
+        );
+    }
 }
 
 pub(super) fn add_arg_comment<'tcx>(
-    fx: &mut FunctionCx<'_, 'tcx, impl Backend>,
+    fx: &mut FunctionCx<'_, '_, 'tcx>,
     kind: &str,
     local: Option<mir::Local>,
     local_field: Option<usize>,
-    params: EmptySinglePair<Value>,
-    pass_mode: PassMode,
-    ty: Ty<'tcx>,
+    params: &[Value],
+    arg_abi_mode: &PassMode,
+    arg_layout: TyAndLayout<'tcx>,
 ) {
+    if !fx.clif_comments.enabled() {
+        return;
+    }
+
     let local = if let Some(local) = local {
         Cow::Owned(format!("{:?}", local))
     } else {
@@ -32,12 +40,16 @@ pub(super) fn add_arg_comment<'tcx>(
     };
 
     let params = match params {
-        Empty => Cow::Borrowed("-"),
-        Single(param) => Cow::Owned(format!("= {:?}", param)),
-        Pair(param_a, param_b) => Cow::Owned(format!("= {:?}, {:?}", param_a, param_b)),
+        [] => Cow::Borrowed("-"),
+        [param] => Cow::Owned(format!("= {:?}", param)),
+        [param_a, param_b] => Cow::Owned(format!("= {:?},{:?}", param_a, param_b)),
+        params => Cow::Owned(format!(
+            "= {}",
+            params.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")
+        )),
     };
 
-    let pass_mode = format!("{:?}", pass_mode);
+    let pass_mode = format!("{:?}", arg_abi_mode);
     fx.add_global_comment(format!(
         "{kind:5}{local:>3}{local_field:<5} {params:10} {pass_mode:36} {ty:?}",
         kind = kind,
@@ -45,64 +57,40 @@ pub(super) fn add_arg_comment<'tcx>(
         local_field = local_field,
         params = params,
         pass_mode = pass_mode,
-        ty = ty,
+        ty = arg_layout.ty,
     ));
 }
 
-pub fn add_locals_header_comment(fx: &mut FunctionCx<impl Backend>) {
-    fx.add_global_comment(String::new());
-    fx.add_global_comment(format!(
-        "kind  local ty                              size align (abi,pref)"
-    ));
+pub(super) fn add_locals_header_comment(fx: &mut FunctionCx<'_, '_, '_>) {
+    if fx.clif_comments.enabled() {
+        fx.add_global_comment(String::new());
+        fx.add_global_comment(
+            "kind  local ty                              size align (abi)".to_string(),
+        );
+    }
 }
 
-pub fn add_local_place_comments<'tcx>(
-    fx: &mut FunctionCx<'_, 'tcx, impl Backend>,
+pub(super) fn add_local_place_comments<'tcx>(
+    fx: &mut FunctionCx<'_, '_, 'tcx>,
     place: CPlace<'tcx>,
     local: Local,
 ) {
-    let TyLayout { ty, details } = place.layout();
-    let ty::layout::LayoutDetails {
-        size,
-        align,
-        abi: _,
-        variants: _,
-        fields: _,
-        largest_niche: _,
-    } = details;
+    if !fx.clif_comments.enabled() {
+        return;
+    }
+    let TyAndLayout { ty, layout } = place.layout();
+    let rustc_abi::LayoutData { size, align, .. } = layout.0.0;
 
-    let (kind, extra) = match *place.inner() {
-        CPlaceInner::Var(var) => {
-            assert_eq!(local, var);
-            ("ssa", std::borrow::Cow::Borrowed(""))
-        }
-        CPlaceInner::NoPlace => ("zst", "".into()),
-        CPlaceInner::Addr(ptr, meta) => {
-            let meta = if let Some(meta) = meta {
-                Cow::Owned(format!(",meta={}", meta))
-            } else {
-                Cow::Borrowed("")
-            };
-            match ptr.base_and_offset() {
-                (crate::pointer::PointerBase::Addr(addr), offset) => {
-                    ("reuse", format!("storage={}{}{}", addr, offset, meta).into())
-                }
-                (crate::pointer::PointerBase::Stack(stack_slot), offset) => {
-                    ("stack", format!("storage={}{}{}", stack_slot, offset, meta).into())
-                }
-            }
-        }
-    };
+    let (kind, extra) = place.debug_comment();
 
     fx.add_global_comment(format!(
-        "{:<5} {:5} {:30} {:4}b {}, {}{}{}",
+        "{:<5} {:5} {:30} {:4}b {}{}{}",
         kind,
         format!("{:?}", local),
         format!("{:?}", ty),
         size.bytes(),
         align.abi.bytes(),
-        align.pref.bytes(),
-        if extra.is_empty() { "" } else { "              " },
+        if extra.is_empty() { "" } else { "                " },
         extra,
     ));
 }

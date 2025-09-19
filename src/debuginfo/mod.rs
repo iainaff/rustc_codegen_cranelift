@@ -1,437 +1,354 @@
-mod emit;
-mod line_info;
+//! Handling of everything related to debuginfo.
 
+mod emit;
+mod gcc_except_table;
+mod line_info;
+mod object;
+mod types;
+mod unwind;
+
+use cranelift_codegen::ir::Endianness;
+use cranelift_codegen::isa::TargetIsa;
+use cranelift_module::DataId;
+use gimli::write::{
+    Address, AttributeValue, DwarfUnit, Expression, FileId, LineProgram, LineString, Range,
+    RangeList, UnitEntryId,
+};
+use gimli::{AArch64, Encoding, Format, LineEncoding, Register, RiscV, RunTimeEndian, X86_64};
+use indexmap::IndexSet;
+use rustc_codegen_ssa::debuginfo::type_names;
+use rustc_hir::def::DefKind;
+use rustc_hir::def_id::DefIdMap;
+use rustc_session::Session;
+use rustc_session::config::DebugInfo;
+use rustc_span::{FileNameDisplayPreference, SourceFileHash, StableSourceFileId};
+use rustc_target::callconv::FnAbi;
+
+pub(crate) use self::emit::{DebugReloc, DebugRelocName};
+pub(crate) use self::types::TypeDebugContext;
+pub(crate) use self::unwind::{EXCEPTION_HANDLER_CATCH, EXCEPTION_HANDLER_CLEANUP, UnwindContext};
+use crate::debuginfo::emit::{address_for_data, address_for_func};
 use crate::prelude::*;
 
-use cranelift_codegen::ir::{StackSlots, ValueLabel, ValueLoc};
-use cranelift_codegen::isa::{RegUnit, TargetIsa};
-use cranelift_codegen::ValueLocRange;
-
-use gimli::write::{
-    self, Address, AttributeValue, DwarfUnit, Expression, LineProgram, LineString, Location,
-    LocationList, Range, RangeList, UnitEntryId, Writer,
-};
-use gimli::{Encoding, Format, LineEncoding, Register, RunTimeEndian, X86_64};
-
-pub use emit::{DebugReloc, DebugRelocName};
-
-fn target_endian(tcx: TyCtxt) -> RunTimeEndian {
-    use rustc::ty::layout::Endian;
-
-    match tcx.data_layout.endian {
-        Endian::Big => RunTimeEndian::Big,
-        Endian::Little => RunTimeEndian::Little,
-    }
+pub(crate) fn producer(sess: &Session) -> String {
+    format!("rustc version {} with cranelift {}", sess.cfg_version, cranelift_codegen::VERSION)
 }
 
-pub struct DebugContext<'tcx> {
-    tcx: TyCtxt<'tcx>,
-
+pub(crate) struct DebugContext {
     endian: RunTimeEndian,
-    symbols: indexmap::IndexMap<FuncId, String>,
 
     dwarf: DwarfUnit,
     unit_range_list: RangeList,
+    created_files: FxHashMap<(StableSourceFileId, SourceFileHash), FileId>,
+    stack_pointer_register: Register,
+    namespace_map: DefIdMap<UnitEntryId>,
+    array_size_type: UnitEntryId,
 
-    types: HashMap<Ty<'tcx>, UnitEntryId>,
+    filename_display_preference: FileNameDisplayPreference,
 }
 
-impl<'tcx> DebugContext<'tcx> {
-    pub fn new(tcx: TyCtxt<'tcx>, address_size: u8) -> Self {
+pub(crate) struct FunctionDebugContext {
+    entry_id: UnitEntryId,
+    function_source_loc: (FileId, u64, u64),
+    source_loc_set: IndexSet<(FileId, u64, u64)>,
+}
+
+impl DebugContext {
+    pub(crate) fn new(
+        tcx: TyCtxt<'_>,
+        isa: &dyn TargetIsa,
+        force_disable_debuginfo: bool,
+        cgu_name: &str,
+    ) -> Option<Self> {
+        if tcx.sess.opts.debuginfo == DebugInfo::None
+            || force_disable_debuginfo
+            || tcx.sess.target.options.is_like_windows
+        {
+            return None;
+        }
+
         let encoding = Encoding {
             format: Format::Dwarf32,
-            // TODO: this should be configurable
+            // FIXME this should be configurable
             // macOS doesn't seem to support DWARF > 3
-            version: 3,
-            address_size,
+            // 5 version is required for md5 file hash
+            version: if tcx.sess.target.is_like_darwin {
+                3
+            } else {
+                // FIXME change to version 5 once the gdb and lldb shipping with the latest debian
+                // support it.
+                4
+            },
+            address_size: isa.frontend_config().pointer_bytes(),
+        };
+
+        let endian = match isa.endianness() {
+            Endianness::Little => RunTimeEndian::Little,
+            Endianness::Big => RunTimeEndian::Big,
+        };
+
+        let stack_pointer_register = match isa.triple().architecture {
+            target_lexicon::Architecture::Aarch64(_) => AArch64::SP,
+            target_lexicon::Architecture::Riscv64(_) => RiscV::SP,
+            target_lexicon::Architecture::X86_64 | target_lexicon::Architecture::X86_64h => {
+                X86_64::RSP
+            }
+            _ => Register(u16::MAX),
         };
 
         let mut dwarf = DwarfUnit::new(encoding);
 
-        // FIXME: how to get version when building out of tree?
-        // Normally this would use option_env!("CFG_VERSION").
-        let producer = format!("cranelift fn (rustc version {})", "unknown version");
-        let comp_dir = tcx.sess.working_dir.0.to_string_lossy().into_owned();
-        let name = match tcx.sess.local_crate_source_file {
-            Some(ref path) => path.to_string_lossy().into_owned(),
-            None => tcx.crate_name(LOCAL_CRATE).to_string(),
+        use rustc_session::config::RemapPathScopeComponents;
+
+        let filename_display_preference =
+            tcx.sess.filename_display_preference(RemapPathScopeComponents::DEBUGINFO);
+
+        let producer = producer(tcx.sess);
+        let comp_dir =
+            tcx.sess.opts.working_dir.to_string_lossy(filename_display_preference).to_string();
+
+        let (name, file_info) = match tcx.sess.local_crate_source_file() {
+            Some(path) => {
+                let name = path.to_string_lossy(filename_display_preference).to_string();
+                (name, None)
+            }
+            None => (tcx.crate_name(LOCAL_CRATE).to_string(), None),
         };
 
-        let line_program = LineProgram::new(
+        let file_has_md5 = file_info.is_some();
+        let mut line_program = LineProgram::new(
             encoding,
             LineEncoding::default(),
             LineString::new(comp_dir.as_bytes(), encoding, &mut dwarf.line_strings),
-            LineString::new(name.as_bytes(), encoding, &mut dwarf.line_strings),
             None,
+            LineString::new(name.as_bytes(), encoding, &mut dwarf.line_strings),
+            file_info,
         );
+        line_program.file_has_md5 = file_has_md5;
+
         dwarf.unit.line_program = line_program;
 
         {
-            let name = dwarf.strings.add(name);
+            let name = dwarf.strings.add(format!("{name}/@/{cgu_name}"));
             let comp_dir = dwarf.strings.add(comp_dir);
 
             let root = dwarf.unit.root();
             let root = dwarf.unit.get_mut(root);
-            root.set(
-                gimli::DW_AT_producer,
-                AttributeValue::StringRef(dwarf.strings.add(producer)),
-            );
-            root.set(
-                gimli::DW_AT_language,
-                AttributeValue::Language(gimli::DW_LANG_Rust),
-            );
+            root.set(gimli::DW_AT_producer, AttributeValue::StringRef(dwarf.strings.add(producer)));
+            root.set(gimli::DW_AT_language, AttributeValue::Language(gimli::DW_LANG_Rust));
             root.set(gimli::DW_AT_name, AttributeValue::StringRef(name));
+
+            // This will be replaced when emitting the debuginfo. It is only
+            // defined here to ensure that the order of the attributes matches
+            // rustc.
+            root.set(gimli::DW_AT_stmt_list, AttributeValue::Udata(0));
+
             root.set(gimli::DW_AT_comp_dir, AttributeValue::StringRef(comp_dir));
-            root.set(
-                gimli::DW_AT_low_pc,
-                AttributeValue::Address(Address::Constant(0)),
-            );
+            root.set(gimli::DW_AT_low_pc, AttributeValue::Address(Address::Constant(0)));
         }
 
-        DebugContext {
-            tcx,
+        let array_size_type = dwarf.unit.add(dwarf.unit.root(), gimli::DW_TAG_base_type);
+        let array_size_type_entry = dwarf.unit.get_mut(array_size_type);
+        array_size_type_entry.set(
+            gimli::DW_AT_name,
+            AttributeValue::StringRef(dwarf.strings.add("__ARRAY_SIZE_TYPE__")),
+        );
+        array_size_type_entry
+            .set(gimli::DW_AT_encoding, AttributeValue::Encoding(gimli::DW_ATE_unsigned));
+        array_size_type_entry.set(
+            gimli::DW_AT_byte_size,
+            AttributeValue::Udata(isa.frontend_config().pointer_bytes().into()),
+        );
 
-            endian: target_endian(tcx),
-            symbols: indexmap::IndexMap::new(),
-
+        Some(DebugContext {
+            endian,
             dwarf,
             unit_range_list: RangeList(Vec::new()),
-
-            types: HashMap::new(),
-        }
+            created_files: FxHashMap::default(),
+            stack_pointer_register,
+            namespace_map: DefIdMap::default(),
+            array_size_type,
+            filename_display_preference,
+        })
     }
 
-    fn dwarf_ty(&mut self, ty: Ty<'tcx>) -> UnitEntryId {
-        if let Some(type_id) = self.types.get(ty) {
-            return *type_id;
+    fn item_namespace(&mut self, tcx: TyCtxt<'_>, def_id: DefId) -> UnitEntryId {
+        if let Some(&scope) = self.namespace_map.get(&def_id) {
+            return scope;
         }
 
-        let new_entry = |dwarf: &mut DwarfUnit, tag| dwarf.unit.add(dwarf.unit.root(), tag);
+        let def_key = tcx.def_key(def_id);
+        let parent_scope = def_key
+            .parent
+            .map(|parent| self.item_namespace(tcx, DefId { krate: def_id.krate, index: parent }))
+            .unwrap_or(self.dwarf.unit.root());
 
-        let primitive = |dwarf: &mut DwarfUnit, ate| {
-            let type_id = new_entry(dwarf, gimli::DW_TAG_base_type);
-            let type_entry = dwarf.unit.get_mut(type_id);
-            type_entry.set(gimli::DW_AT_encoding, AttributeValue::Encoding(ate));
-            type_id
+        let namespace_name = {
+            let mut output = String::new();
+            type_names::push_item_name(tcx, def_id, false, &mut output);
+            output
         };
+        let namespace_name_id = self.dwarf.strings.add(namespace_name);
 
-        let name = format!("{}", ty);
-        let layout = self.tcx.layout_of(ParamEnv::reveal_all().and(ty)).unwrap();
+        let scope = self.dwarf.unit.add(parent_scope, gimli::DW_TAG_namespace);
+        let scope_entry = self.dwarf.unit.get_mut(scope);
+        scope_entry.set(gimli::DW_AT_name, AttributeValue::StringRef(namespace_name_id));
 
-        let type_id = match ty.kind {
-            ty::Bool => primitive(&mut self.dwarf, gimli::DW_ATE_boolean),
-            ty::Char => primitive(&mut self.dwarf, gimli::DW_ATE_UTF),
-            ty::Uint(_) => primitive(&mut self.dwarf, gimli::DW_ATE_unsigned),
-            ty::Int(_) => primitive(&mut self.dwarf, gimli::DW_ATE_signed),
-            ty::Float(_) => primitive(&mut self.dwarf, gimli::DW_ATE_float),
-            ty::Ref(_, pointee_ty, _mutbl)
-            | ty::RawPtr(ty::TypeAndMut {
-                ty: pointee_ty,
-                mutbl: _mutbl,
-            }) => {
-                let type_id = new_entry(&mut self.dwarf, gimli::DW_TAG_pointer_type);
-
-                // Ensure that type is inserted before recursing to avoid duplicates
-                self.types.insert(ty, type_id);
-
-                let pointee = self.dwarf_ty(pointee_ty);
-
-                let type_entry = self.dwarf.unit.get_mut(type_id);
-
-                //type_entry.set(gimli::DW_AT_mutable, AttributeValue::Flag(mutbl == rustc_hir::Mutability::Mut));
-                type_entry.set(gimli::DW_AT_type, AttributeValue::ThisUnitEntryRef(pointee));
-
-                type_id
-            }
-            ty::Adt(adt_def, _substs) if adt_def.is_struct() && !layout.is_unsized() => {
-                let type_id = new_entry(&mut self.dwarf, gimli::DW_TAG_structure_type);
-
-                // Ensure that type is inserted before recursing to avoid duplicates
-                self.types.insert(ty, type_id);
-
-                let variant = adt_def.non_enum_variant();
-
-                for (field_idx, field_def) in variant.fields.iter().enumerate() {
-                    let field_offset = layout.fields.offset(field_idx);
-                    let field_layout = layout.field(&layout::LayoutCx {
-                        tcx: self.tcx,
-                        param_env: ParamEnv::reveal_all(),
-                    }, field_idx).unwrap();
-
-                    let field_type = self.dwarf_ty(field_layout.ty);
-
-                    let field_id = self.dwarf.unit.add(type_id, gimli::DW_TAG_member);
-                    let field_entry = self.dwarf.unit.get_mut(field_id);
-
-                    field_entry.set(gimli::DW_AT_name, AttributeValue::String(field_def.ident.as_str().to_string().into_bytes()));
-                    field_entry.set(gimli::DW_AT_data_member_location, AttributeValue::Udata(field_offset.bytes()));
-                    field_entry.set(gimli::DW_AT_type, AttributeValue::ThisUnitEntryRef(field_type));
-                }
-
-                type_id
-            }
-            _ => new_entry(&mut self.dwarf, gimli::DW_TAG_structure_type),
-        };
-
-        let type_entry = self.dwarf.unit.get_mut(type_id);
-
-        type_entry.set(gimli::DW_AT_name, AttributeValue::String(name.into_bytes()));
-        type_entry.set(
-            gimli::DW_AT_byte_size,
-            AttributeValue::Udata(layout.size.bytes()),
-        );
-
-        self.types.insert(ty, type_id);
-
-        type_id
+        self.namespace_map.insert(def_id, scope);
+        scope
     }
-}
 
-pub struct FunctionDebugContext<'a, 'tcx> {
-    debug_context: &'a mut DebugContext<'tcx>,
-    entry_id: UnitEntryId,
-    symbol: usize,
-    instance: Instance<'tcx>,
-    mir: &'tcx mir::Body<'tcx>,
-}
-
-impl<'a, 'tcx> FunctionDebugContext<'a, 'tcx> {
-    pub fn new(
-        debug_context: &'a mut DebugContext<'tcx>,
+    pub(crate) fn define_function<'tcx>(
+        &mut self,
+        tcx: TyCtxt<'tcx>,
+        type_dbg: &mut TypeDebugContext<'tcx>,
         instance: Instance<'tcx>,
-        func_id: FuncId,
-        name: &str,
-    ) -> Self {
-        let mir = *debug_context.tcx.instance_mir(instance.def);
+        fn_abi: &'tcx FnAbi<'tcx, Ty<'tcx>>,
+        linkage_name: &str,
+        function_span: Span,
+    ) -> FunctionDebugContext {
+        let (file_id, line, column) = self.get_span_loc(tcx, function_span, function_span);
 
-        let (symbol, _) = debug_context.symbols.insert_full(func_id, name.to_string());
+        let scope = self.item_namespace(tcx, tcx.parent(instance.def_id()));
 
-        // FIXME: add to appropriate scope intead of root
-        let scope = debug_context.dwarf.unit.root();
+        let mut name = String::new();
+        type_names::push_item_name(tcx, instance.def_id(), false, &mut name);
 
-        let entry_id = debug_context
-            .dwarf
-            .unit
-            .add(scope, gimli::DW_TAG_subprogram);
-        let entry = debug_context.dwarf.unit.get_mut(entry_id);
-        let name_id = debug_context.dwarf.strings.add(name);
-        entry.set(
-            gimli::DW_AT_linkage_name,
-            AttributeValue::StringRef(name_id),
+        // Find the enclosing function, in case this is a closure.
+        let enclosing_fn_def_id = tcx.typeck_root_def_id(instance.def_id());
+
+        // We look up the generics of the enclosing function and truncate the args
+        // to their length in order to cut off extra stuff that might be in there for
+        // closures or coroutines.
+        let generics = tcx.generics_of(enclosing_fn_def_id);
+        let args = instance.args.truncate_to(tcx, generics);
+
+        type_names::push_generic_params(
+            tcx,
+            tcx.normalize_erasing_regions(ty::TypingEnv::fully_monomorphized(), args),
+            &mut name,
         );
+
+        let entry_id = self.dwarf.unit.add(scope, gimli::DW_TAG_subprogram);
+        let entry = self.dwarf.unit.get_mut(entry_id);
+        let linkage_name_id =
+            if name != linkage_name { Some(self.dwarf.strings.add(linkage_name)) } else { None };
+        let name_id = self.dwarf.strings.add(name);
+
+        // These will be replaced in FunctionDebugContext::finalize. They are
+        // only defined here to ensure that the order of the attributes matches
+        // rustc.
+        entry.set(gimli::DW_AT_low_pc, AttributeValue::Udata(0));
+        entry.set(gimli::DW_AT_high_pc, AttributeValue::Udata(0));
+
+        let mut frame_base_expr = Expression::new();
+        frame_base_expr.op_reg(self.stack_pointer_register);
+        entry.set(gimli::DW_AT_frame_base, AttributeValue::Exprloc(frame_base_expr));
+
+        if let Some(linkage_name_id) = linkage_name_id {
+            entry.set(gimli::DW_AT_linkage_name, AttributeValue::StringRef(linkage_name_id));
+        }
+        // Gdb requires DW_AT_name. Otherwise the DW_TAG_subprogram is skipped.
+        entry.set(gimli::DW_AT_name, AttributeValue::StringRef(name_id));
+
+        entry.set(gimli::DW_AT_decl_file, AttributeValue::FileIndex(Some(file_id)));
+        entry.set(gimli::DW_AT_decl_line, AttributeValue::Udata(line));
+
+        if !fn_abi.ret.is_ignore() {
+            let return_dw_ty = self.debug_type(tcx, type_dbg, fn_abi.ret.layout.ty);
+            let entry = self.dwarf.unit.get_mut(entry_id);
+            entry.set(gimli::DW_AT_type, AttributeValue::UnitRef(return_dw_ty));
+        }
+
+        if tcx.is_reachable_non_generic(instance.def_id()) {
+            let entry = self.dwarf.unit.get_mut(entry_id);
+            entry.set(gimli::DW_AT_external, AttributeValue::FlagPresent);
+        }
 
         FunctionDebugContext {
-            debug_context,
             entry_id,
-            symbol,
-            instance,
-            mir,
+            function_source_loc: (file_id, line, column),
+            source_loc_set: IndexSet::new(),
         }
     }
 
-    fn define_local(&mut self, name: String, ty: Ty<'tcx>) -> UnitEntryId {
-        let ty = self.debug_context.tcx.subst_and_normalize_erasing_regions(
-            self.instance.substs,
-            ty::ParamEnv::reveal_all(),
-            &ty,
-        );
-        let dw_ty = self.debug_context.dwarf_ty(ty);
-
-        let var_id = self
-            .debug_context
-            .dwarf
-            .unit
-            .add(self.entry_id, gimli::DW_TAG_variable);
-        let var_entry = self.debug_context.dwarf.unit.get_mut(var_id);
-
-        var_entry.set(gimli::DW_AT_name, AttributeValue::String(name.into_bytes()));
-        var_entry.set(gimli::DW_AT_type, AttributeValue::ThisUnitEntryRef(dw_ty));
-
-        var_id
-    }
-
-    pub fn define(
+    // Adapted from https://github.com/rust-lang/rust/blob/10a7aa14fed9b528b74b0f098c4899c37c09a9c7/compiler/rustc_codegen_llvm/src/debuginfo/metadata.rs#L1288-L1346
+    pub(crate) fn define_static<'tcx>(
         &mut self,
-        context: &Context,
-        isa: &dyn TargetIsa,
-        source_info_set: &indexmap::IndexSet<SourceInfo>,
-        local_map: HashMap<mir::Local, CPlace<'tcx>>,
+        tcx: TyCtxt<'tcx>,
+        type_dbg: &mut TypeDebugContext<'tcx>,
+        def_id: DefId,
+        data_id: DataId,
     ) {
-        let end = self.create_debug_lines(context, isa, source_info_set);
+        let DefKind::Static { nested, .. } = tcx.def_kind(def_id) else { bug!() };
+        if nested {
+            return;
+        }
 
-        self.debug_context
+        let scope = self.item_namespace(tcx, tcx.parent(def_id));
+
+        let span = tcx.def_span(def_id);
+        let (file_id, line, _column) = self.get_span_loc(tcx, span, span);
+
+        let static_type = Instance::mono(tcx, def_id).ty(tcx, ty::TypingEnv::fully_monomorphized());
+        let static_layout = tcx
+            .layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(static_type))
+            .unwrap();
+        // FIXME use the actual type layout
+        let type_id = self.debug_type(tcx, type_dbg, static_type);
+
+        let name = tcx.item_name(def_id);
+        let linkage_name = tcx.symbol_name(Instance::mono(tcx, def_id)).name;
+
+        let entry_id = self.dwarf.unit.add(scope, gimli::DW_TAG_variable);
+        let entry = self.dwarf.unit.get_mut(entry_id);
+        let linkage_name_id = if name.as_str() != linkage_name {
+            Some(self.dwarf.strings.add(linkage_name))
+        } else {
+            None
+        };
+        let name_id = self.dwarf.strings.add(name.as_str());
+
+        entry.set(gimli::DW_AT_name, AttributeValue::StringRef(name_id));
+        entry.set(gimli::DW_AT_type, AttributeValue::UnitRef(type_id));
+
+        if tcx.is_reachable_non_generic(def_id) {
+            entry.set(gimli::DW_AT_external, AttributeValue::FlagPresent);
+        }
+
+        entry.set(gimli::DW_AT_decl_file, AttributeValue::FileIndex(Some(file_id)));
+        entry.set(gimli::DW_AT_decl_line, AttributeValue::Udata(line));
+
+        entry.set(gimli::DW_AT_alignment, AttributeValue::Udata(static_layout.align.abi.bytes()));
+
+        let mut expr = Expression::new();
+        expr.op_addr(address_for_data(data_id));
+        entry.set(gimli::DW_AT_location, AttributeValue::Exprloc(expr));
+
+        if let Some(linkage_name_id) = linkage_name_id {
+            entry.set(gimli::DW_AT_linkage_name, AttributeValue::StringRef(linkage_name_id));
+        }
+    }
+}
+
+impl FunctionDebugContext {
+    pub(crate) fn finalize(
+        mut self,
+        debug_context: &mut DebugContext,
+        func_id: FuncId,
+        context: &Context,
+    ) {
+        let end = self.create_debug_lines(debug_context, func_id, context);
+
+        debug_context
             .unit_range_list
             .0
-            .push(Range::StartLength {
-                begin: Address::Symbol {
-                    symbol: self.symbol,
-                    addend: 0,
-                },
-                length: end as u64,
-            });
+            .push(Range::StartLength { begin: address_for_func(func_id), length: u64::from(end) });
 
-        // FIXME make it more reliable and implement scopes before re-enabling this.
-        if false {
-            let value_labels_ranges = context.build_value_labels_ranges(isa).unwrap();
-
-            for (local, _local_decl) in self.mir.local_decls.iter_enumerated() {
-                let var_id = self.define_local(format!("{:?}", local), &self.mir.local_decls[local].ty);
-
-                let location = place_location(
-                    self,
-                    isa,
-                    context,
-                    &local_map,
-                    &value_labels_ranges,
-                    Place {
-                        local,
-                        projection: ty::List::empty(),
-                    },
-                );
-
-                let var_entry = self.debug_context.dwarf.unit.get_mut(var_id);
-                var_entry.set(gimli::DW_AT_location, location);
-            }
-        }
-
-        // FIXME create locals for all entries in mir.var_debug_info
-    }
-}
-
-fn place_location<'a, 'tcx>(
-    func_debug_ctx: &mut FunctionDebugContext<'a, 'tcx>,
-    isa: &dyn TargetIsa,
-    context: &Context,
-    local_map: &HashMap<mir::Local, CPlace<'tcx>>,
-    value_labels_ranges: &HashMap<ValueLabel, Vec<ValueLocRange>>,
-    place: Place<'tcx>,
-) -> AttributeValue {
-    assert!(place.projection.is_empty()); // FIXME implement them
-
-    match local_map[&place.local].inner() {
-        CPlaceInner::Var(local) => {
-            let value_label = cranelift_codegen::ir::ValueLabel::from_u32(local.as_u32());
-            if let Some(value_loc_ranges) = value_labels_ranges.get(&value_label) {
-                let loc_list = LocationList(
-                    value_loc_ranges
-                        .iter()
-                        .map(|value_loc_range| Location::StartEnd {
-                            begin: Address::Symbol {
-                                symbol: func_debug_ctx.symbol,
-                                addend: i64::from(value_loc_range.start),
-                            },
-                            end: Address::Symbol {
-                                symbol: func_debug_ctx.symbol,
-                                addend: i64::from(value_loc_range.end),
-                            },
-                            data: Expression(
-                                translate_loc(isa, value_loc_range.loc, &context.func.stack_slots).unwrap(),
-                            ),
-                        })
-                        .collect(),
-                );
-                let loc_list_id = func_debug_ctx.debug_context.dwarf.unit.locations.add(loc_list);
-
-                AttributeValue::LocationListRef(loc_list_id)
-            } else {
-                // FIXME set value labels for unused locals
-
-                AttributeValue::Exprloc(Expression(vec![]))
-            }
-        }
-        CPlaceInner::Addr(_, _) => {
-            // FIXME implement this (used by arguments and returns)
-
-            AttributeValue::Exprloc(Expression(vec![]))
-
-            // For PointerBase::Stack:
-            //AttributeValue::Exprloc(Expression(translate_loc(ValueLoc::Stack(*stack_slot), &context.func.stack_slots).unwrap()))
-        }
-        CPlaceInner::NoPlace => AttributeValue::Exprloc(Expression(vec![])),
-    }
-}
-
-
-
-
-
-// Adapted from https://github.com/bytecodealliance/wasmtime/blob/50496efb6bac32aaf469c6d9186b322de83549bf/crates/debug/src/transform/map_reg.rs
-pub(crate) fn map_reg(isa: &dyn TargetIsa, reg: RegUnit) -> Register {
-    // TODO avoid duplication with fde.rs
-    assert!(isa.name() == "x86" && isa.pointer_bits() == 64);
-    // Mapping from https://github.com/bytecodealliance/cranelift/pull/902 by @iximeow
-    const X86_GP_REG_MAP: [Register; 16] = [
-        X86_64::RAX,
-        X86_64::RCX,
-        X86_64::RDX,
-        X86_64::RBX,
-        X86_64::RSP,
-        X86_64::RBP,
-        X86_64::RSI,
-        X86_64::RDI,
-        X86_64::R8,
-        X86_64::R9,
-        X86_64::R10,
-        X86_64::R11,
-        X86_64::R12,
-        X86_64::R13,
-        X86_64::R14,
-        X86_64::R15,
-    ];
-    const X86_XMM_REG_MAP: [Register; 16] = [
-        X86_64::XMM0,
-        X86_64::XMM1,
-        X86_64::XMM2,
-        X86_64::XMM3,
-        X86_64::XMM4,
-        X86_64::XMM5,
-        X86_64::XMM6,
-        X86_64::XMM7,
-        X86_64::XMM8,
-        X86_64::XMM9,
-        X86_64::XMM10,
-        X86_64::XMM11,
-        X86_64::XMM12,
-        X86_64::XMM13,
-        X86_64::XMM14,
-        X86_64::XMM15,
-    ];
-    let reg_info = isa.register_info();
-    let bank = reg_info.bank_containing_regunit(reg).unwrap();
-    match bank.name {
-        "IntRegs" => {
-            // x86 GP registers have a weird mapping to DWARF registers, so we use a
-            // lookup table.
-            X86_GP_REG_MAP[(reg - bank.first_unit) as usize]
-        }
-        "FloatRegs" => X86_XMM_REG_MAP[(reg - bank.first_unit) as usize],
-        bank_name => {
-            panic!("unsupported register bank: {}", bank_name);
-        }
-    }
-}
-
-// Adapted from https://github.com/CraneStation/wasmtime/blob/5a1845b4caf7a5dba8eda1fef05213a532ed4259/crates/debug/src/transform/expression.rs#L59-L137
-fn translate_loc(isa: &dyn TargetIsa, loc: ValueLoc, stack_slots: &StackSlots) -> Option<Vec<u8>> {
-    match loc {
-        ValueLoc::Reg(reg) => {
-            let machine_reg = map_reg(isa, reg).0 as u8;
-            assert!(machine_reg <= 32); // FIXME
-            Some(vec![gimli::constants::DW_OP_reg0.0 + machine_reg])
-        }
-        ValueLoc::Stack(ss) => {
-            if let Some(ss_offset) = stack_slots[ss].offset {
-                let endian = gimli::RunTimeEndian::Little;
-                let mut writer = write::EndianVec::new(endian);
-                writer
-                    .write_u8(gimli::constants::DW_OP_breg0.0 + X86_64::RBP.0 as u8)
-                    .expect("bp wr");
-                writer.write_sleb128(ss_offset as i64 + 16).expect("ss wr");
-                let buf = writer.into_vec();
-                return Some(buf);
-            }
-            None
-        }
-        _ => None,
+        let func_entry = debug_context.dwarf.unit.get_mut(self.entry_id);
+        // Gdb requires both DW_AT_low_pc and DW_AT_high_pc. Otherwise the DW_TAG_subprogram is skipped.
+        func_entry.set(gimli::DW_AT_low_pc, AttributeValue::Address(address_for_func(func_id)));
+        // Using Udata for DW_AT_high_pc requires at least DWARF4
+        func_entry.set(gimli::DW_AT_high_pc, AttributeValue::Udata(u64::from(end)));
     }
 }

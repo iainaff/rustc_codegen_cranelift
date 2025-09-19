@@ -1,22 +1,9 @@
 // Adapted from rustc run-pass test suite
 
-#![feature(no_core, arbitrary_self_types, box_syntax)]
-#![feature(rustc_attrs)]
+#![feature(arbitrary_self_types, unsize, coerce_unsized, dispatch_from_dyn)]
 
-#![feature(start, lang_items)]
-#![no_core]
-
-extern crate mini_core;
-
-use mini_core::*;
-
-macro_rules! assert_eq {
-    ($l:expr, $r: expr) => {
-        if $l != $r {
-            panic(&(stringify!($l != $r), file!(), line!(), 0));
-        }
-    }
-}
+use std::marker::Unsize;
+use std::ops::{CoerceUnsized, Deref, DispatchFromDyn};
 
 struct Ptr<T: ?Sized>(Box<T>);
 
@@ -44,12 +31,7 @@ impl<T: ?Sized> Deref for Wrapper<T> {
 impl<T: CoerceUnsized<U>, U> CoerceUnsized<Wrapper<U>> for Wrapper<T> {}
 impl<T: DispatchFromDyn<U>, U> DispatchFromDyn<Wrapper<U>> for Wrapper<T> {}
 
-
 trait Trait {
-    // This method isn't object-safe yet. Unsized by-value `self` is object-safe (but not callable
-    // without unsized_locals), but wrappers arond `Self` currently are not.
-    // FIXME (mikeyhew) uncomment this when unsized rvalues object-safety is implemented
-    // fn wrapper(self: Wrapper<Self>) -> i32;
     fn ptr_wrapper(self: Ptr<Wrapper<Self>>) -> i32;
     fn wrapper_ptr(self: Wrapper<Ptr<Self>>) -> i32;
     fn wrapper_ptr_wrapper(self: Wrapper<Ptr<Wrapper<Self>>>) -> i32;
@@ -67,16 +49,13 @@ impl Trait for i32 {
     }
 }
 
-#[start]
-fn main(_: isize, _: *const *const u8) -> isize {
-    let pw = Ptr(box Wrapper(5)) as Ptr<Wrapper<dyn Trait>>;
+fn main() {
+    let pw = Ptr(Box::new(Wrapper(5))) as Ptr<Wrapper<dyn Trait>>;
     assert_eq!(pw.ptr_wrapper(), 5);
 
-    let wp = Wrapper(Ptr(box 6)) as Wrapper<Ptr<dyn Trait>>;
+    let wp = Wrapper(Ptr(Box::new(6))) as Wrapper<Ptr<dyn Trait>>;
     assert_eq!(wp.wrapper_ptr(), 6);
 
-    let wpw = Wrapper(Ptr(box Wrapper(7))) as Wrapper<Ptr<Wrapper<dyn Trait>>>;
+    let wpw = Wrapper(Ptr(Box::new(Wrapper(7)))) as Wrapper<Ptr<Wrapper<dyn Trait>>>;
     assert_eq!(wpw.wrapper_ptr_wrapper(), 7);
-
-    0
 }

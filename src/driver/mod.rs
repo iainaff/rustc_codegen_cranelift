@@ -1,128 +1,82 @@
-use std::any::Any;
+//! Drivers are responsible for calling [`codegen_fn`] or [`codegen_static`] for each mono item and
+//! performing any further actions like JIT executing or writing object files.
+//!
+//! [`codegen_fn`]: crate::base::codegen_fn
+//! [`codegen_static`]: crate::constant::codegen_static
 
-use rustc::middle::cstore::EncodedMetadata;
-use rustc::mir::mono::{Linkage as RLinkage, Visibility};
+use rustc_data_structures::profiling::SelfProfilerRef;
+use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
+use rustc_middle::mir::mono::{MonoItem, MonoItemData};
 
 use crate::prelude::*;
 
-mod aot;
-#[cfg(not(target_arch = "wasm32"))]
-mod jit;
+pub(crate) mod aot;
+#[cfg(feature = "jit")]
+pub(crate) mod jit;
 
-pub fn codegen_crate(
-    tcx: TyCtxt<'_>,
-    metadata: EncodedMetadata,
-    need_metadata_module: bool,
-) -> Box<dyn Any> {
-    tcx.sess.abort_if_errors();
-
-    if std::env::var("CG_CLIF_JIT").is_ok()
-        && tcx.sess.crate_types.get().contains(&CrateType::Executable)
-    {
-        #[cfg(not(target_arch = "wasm32"))]
-        let _: ! = jit::run_jit(tcx);
-
-        #[cfg(target_arch = "wasm32")]
-        panic!("jit not supported on wasm");
-    }
-
-    aot::run_aot(tcx, metadata, need_metadata_module)
-}
-
-fn codegen_mono_items<'tcx>(
+fn predefine_mono_items<'tcx>(
     tcx: TyCtxt<'tcx>,
-    module: &mut Module<impl Backend + 'static>,
-    debug_context: Option<&mut DebugContext<'tcx>>,
-    mono_items: Vec<(MonoItem<'tcx>, (RLinkage, Visibility))>,
+    module: &mut dyn Module,
+    mono_items: &[(MonoItem<'tcx>, MonoItemData)],
 ) {
-    let mut cx = CodegenCx::new(tcx, module, debug_context);
-
-    tcx.sess.time("predefine functions", || {
-        for &(mono_item, (linkage, visibility)) in &mono_items {
+    tcx.prof.generic_activity("predefine functions").run(|| {
+        let is_compiler_builtins = tcx.is_compiler_builtins(LOCAL_CRATE);
+        for &(mono_item, data) in mono_items {
             match mono_item {
                 MonoItem::Fn(instance) => {
-                    let (name, sig) =
-                        get_function_name_and_sig(tcx, cx.module.isa().triple(), instance, false);
-                    let linkage = crate::linkage::get_clif_linkage(mono_item, linkage, visibility);
-                    cx.module.declare_function(&name, linkage, &sig).unwrap();
+                    let name = tcx.symbol_name(instance).name;
+                    let _inst_guard = crate::PrintOnPanic(|| format!("{:?} {}", instance, name));
+                    let sig =
+                        get_function_sig(tcx, module.target_config().default_call_conv, instance);
+                    let linkage = crate::linkage::get_clif_linkage(
+                        mono_item,
+                        data.linkage,
+                        data.visibility,
+                        is_compiler_builtins,
+                    );
+                    let is_naked = tcx
+                        .codegen_instance_attrs(instance.def)
+                        .flags
+                        .contains(CodegenFnAttrFlags::NAKED);
+                    if is_naked {
+                        // Naked functions are defined in a separate object
+                        // file, so they can be declared on the fly.
+                        continue;
+                    }
+                    module.declare_function(name, linkage, &sig).unwrap();
                 }
                 MonoItem::Static(_) | MonoItem::GlobalAsm(_) => {}
             }
         }
     });
-
-    for (mono_item, (linkage, visibility)) in mono_items {
-        let linkage = crate::linkage::get_clif_linkage(mono_item, linkage, visibility);
-        trans_mono_item(&mut cx, mono_item, linkage);
-    }
-
-    tcx.sess.time("finalize CodegenCx", || cx.finalize());
 }
 
-fn trans_mono_item<'clif, 'tcx, B: Backend + 'static>(
-    cx: &mut crate::CodegenCx<'clif, 'tcx, B>,
-    mono_item: MonoItem<'tcx>,
-    linkage: Linkage,
-) {
-    let tcx = cx.tcx;
-    match mono_item {
-        MonoItem::Fn(inst) => {
-            let _inst_guard =
-                PrintOnPanic(|| format!("{:?} {}", inst, tcx.symbol_name(inst).name.as_str()));
-            debug_assert!(!inst.substs.needs_infer());
-            let _mir_guard = PrintOnPanic(|| {
-                match inst.def {
-                    InstanceDef::Item(_)
-                    | InstanceDef::DropGlue(_, _)
-                    | InstanceDef::Virtual(_, _) => {
-                        let mut mir = ::std::io::Cursor::new(Vec::new());
-                        crate::rustc_mir::util::write_mir_pretty(
-                            tcx,
-                            Some(inst.def_id()),
-                            &mut mir,
-                        )
-                        .unwrap();
-                        String::from_utf8(mir.into_inner()).unwrap()
-                    }
-                    _ => {
-                        // FIXME fix write_mir_pretty for these instances
-                        format!("{:#?}", tcx.instance_mir(inst.def))
-                    }
-                }
-            });
+struct MeasuremeProfiler(SelfProfilerRef);
 
-            cx.tcx.sess.time("codegen fn", || crate::base::trans_fn(cx, inst, linkage));
-        }
-        MonoItem::Static(def_id) => {
-            crate::constant::codegen_static(&mut cx.constants_cx, def_id);
-        }
-        MonoItem::GlobalAsm(hir_id) => {
-            let item = tcx.hir().expect_item(hir_id);
-            if let rustc_hir::ItemKind::GlobalAsm(rustc_hir::GlobalAsm { asm }) = item.kind {
-                // FIXME implement global asm using an external assembler
-                if asm.as_str().contains("__rust_probestack") {
-                    return;
-                } else {
-                    tcx
-                        .sess
-                        .fatal(&format!("Unimplemented global asm mono item \"{}\"", asm));
-                }
-            } else {
-                bug!("Expected GlobalAsm found {:?}", item);
-            }
+struct TimingGuard {
+    profiler: std::mem::ManuallyDrop<SelfProfilerRef>,
+    inner: Option<rustc_data_structures::profiling::TimingGuard<'static>>,
+}
+
+impl Drop for TimingGuard {
+    fn drop(&mut self) {
+        self.inner.take();
+        unsafe {
+            std::mem::ManuallyDrop::drop(&mut self.profiler);
         }
     }
 }
 
-fn time<R>(tcx: TyCtxt<'_>, name: &'static str, f: impl FnOnce() -> R) -> R {
-    if std::env::var("CG_CLIF_DISPLAY_CG_TIME").is_ok() {
-        println!("[{:<30}: {}] start", tcx.crate_name(LOCAL_CRATE), name);
-        let before = std::time::Instant::now();
-        let res = tcx.sess.time(name, f);
-        let after = std::time::Instant::now();
-        println!("[{:<30}: {}] end time: {:?}", tcx.crate_name(LOCAL_CRATE), name, after - before);
-        res
-    } else {
-        tcx.sess.time(name, f)
+impl cranelift_codegen::timing::Profiler for MeasuremeProfiler {
+    fn start_pass(&self, pass: cranelift_codegen::timing::Pass) -> Box<dyn std::any::Any> {
+        let mut timing_guard = Box::new(TimingGuard {
+            profiler: std::mem::ManuallyDrop::new(self.0.clone()),
+            inner: None,
+        });
+        timing_guard.inner = Some(
+            unsafe { &*(&*timing_guard.profiler as &SelfProfilerRef as *const SelfProfilerRef) }
+                .generic_activity(pass.description()),
+        );
+        timing_guard
     }
 }

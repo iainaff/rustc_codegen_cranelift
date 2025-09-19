@@ -1,289 +1,270 @@
-#![feature(rustc_private, decl_macro, type_alias_impl_trait, associated_type_bounds, never_type)]
-#![allow(intra_doc_link_resolution_failure)]
+// tidy-alphabetical-start
+#![allow(rustc::diagnostic_outside_of_impl)]
+#![allow(rustc::untranslatable_diagnostic)]
+#![cfg_attr(doc, allow(internal_features))]
+#![cfg_attr(doc, doc(rust_logo))]
+#![cfg_attr(doc, feature(rustdoc_internals))]
+// Note: please avoid adding other feature gates where possible
+#![feature(rustc_private)]
+// Only used to define intrinsics in `compiler_builtins.rs`.
+#![feature(f16)]
+#![feature(f128)]
+// Note: please avoid adding other feature gates where possible
+#![warn(rust_2018_idioms)]
+#![warn(unreachable_pub)]
+#![warn(unused_lifetimes)]
+// tidy-alphabetical-end
 
-extern crate flate2;
-extern crate libc;
-extern crate tempfile;
-extern crate rustc;
+#[macro_use]
+extern crate rustc_middle;
+extern crate rustc_abi;
+extern crate rustc_ast;
 extern crate rustc_codegen_ssa;
-extern crate rustc_codegen_utils;
+extern crate rustc_const_eval;
 extern crate rustc_data_structures;
-extern crate rustc_driver;
+extern crate rustc_errors;
 extern crate rustc_fs_util;
 extern crate rustc_hir;
 extern crate rustc_incremental;
 extern crate rustc_index;
-extern crate rustc_mir;
+extern crate rustc_metadata;
 extern crate rustc_session;
 extern crate rustc_span;
+extern crate rustc_symbol_mangling;
 extern crate rustc_target;
-extern crate rustc_ast;
+#[macro_use]
+extern crate tracing;
+
+// This prevents duplicating functions and statics that are already part of the host rustc process.
+#[allow(unused_extern_crates)]
+extern crate rustc_driver;
 
 use std::any::Any;
+use std::env;
+use std::sync::Arc;
 
-use rustc::dep_graph::{DepGraph, WorkProduct, WorkProductId};
-use rustc::middle::cstore::{EncodedMetadata, MetadataLoader};
-use rustc::session::config::OutputFilenames;
-use rustc::ty::query::Providers;
-use rustc::util::common::ErrorReported;
-use rustc_codegen_utils::codegen_backend::CodegenBackend;
+use cranelift_codegen::isa::TargetIsa;
+use cranelift_codegen::settings::{self, Configurable};
+use rustc_codegen_ssa::traits::CodegenBackend;
+use rustc_codegen_ssa::{CodegenResults, TargetConfig};
+use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
+use rustc_session::Session;
+use rustc_session::config::OutputFilenames;
+use rustc_span::{Symbol, sym};
 
-use cranelift_codegen::settings;
-
-use crate::constant::ConstantCx;
+pub use crate::config::*;
 use crate::prelude::*;
 
 mod abi;
 mod allocator;
 mod analyze;
-mod archive;
-mod atomic_shim;
 mod base;
-mod backend;
 mod cast;
+mod codegen_f16_f128;
 mod codegen_i128;
 mod common;
+mod compiler_builtins;
+mod concurrency_limiter;
+mod config;
 mod constant;
 mod debuginfo;
 mod discriminant;
 mod driver;
+mod global_asm;
+mod inline_asm;
 mod intrinsics;
 mod linkage;
 mod main_shim;
-mod metadata;
 mod num;
 mod optimize;
 mod pointer;
 mod pretty_clif;
-mod target_features_whitelist;
-mod trap;
+mod toolchain;
 mod unsize;
+mod unwind_module;
 mod value_and_place;
 mod vtable;
 
 mod prelude {
-    pub use std::any::Any;
-    pub use std::collections::{HashMap, HashSet};
-    pub use std::convert::{TryFrom, TryInto};
-
-    pub use rustc_ast::ast::{FloatTy, IntTy, UintTy};
-    pub use rustc_span::{Pos, Span};
-
-    pub use rustc::bug;
-    pub use rustc_hir::def_id::{CrateNum, DefId, LOCAL_CRATE};
-    pub use rustc::mir::{self, interpret::AllocId, mono::MonoItem, *};
-    pub use rustc::session::{
-        config::{CrateType, Lto},
-        Session,
+    pub(crate) use cranelift_codegen::Context;
+    pub(crate) use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+    pub(crate) use cranelift_codegen::ir::function::Function;
+    pub(crate) use cranelift_codegen::ir::{
+        AbiParam, Block, FuncRef, Inst, InstBuilder, MemFlags, Signature, SourceLoc, StackSlot,
+        StackSlotData, StackSlotKind, TrapCode, Type, Value, types,
     };
-    pub use rustc::ty::layout::{self, Abi, LayoutOf, Scalar, Size, TyLayout, VariantIdx};
-    pub use rustc::ty::{
-        self, FnSig, Instance, InstanceDef, ParamEnv, PolyFnSig, Ty, TyCtxt, TypeAndMut,
-        TypeFoldable,
+    pub(crate) use cranelift_module::{self, DataDescription, FuncId, Linkage, Module};
+    pub(crate) use rustc_abi::{BackendRepr, FIRST_VARIANT, FieldIdx, Scalar, Size, VariantIdx};
+    pub(crate) use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
+    pub(crate) use rustc_hir::def_id::{DefId, LOCAL_CRATE};
+    pub(crate) use rustc_index::Idx;
+    pub(crate) use rustc_middle::mir::{self, *};
+    pub(crate) use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
+    pub(crate) use rustc_middle::ty::{
+        self, FloatTy, Instance, InstanceKind, IntTy, Ty, TyCtxt, UintTy,
     };
+    pub(crate) use rustc_span::Span;
 
-    pub use rustc_data_structures::{
-        fx::{FxHashMap, FxHashSet},
-        sync::Lrc,
-    };
+    pub(crate) use crate::abi::*;
+    pub(crate) use crate::base::{codegen_operand, codegen_place};
+    pub(crate) use crate::cast::*;
+    pub(crate) use crate::common::*;
+    pub(crate) use crate::debuginfo::{DebugContext, UnwindContext};
+    pub(crate) use crate::pointer::Pointer;
+    pub(crate) use crate::value_and_place::{CPlace, CValue};
+}
 
-    pub use rustc_index::vec::Idx;
-
-    pub use rustc_codegen_ssa::mir::operand::{OperandRef, OperandValue};
-    pub use rustc_codegen_ssa::traits::*;
-    pub use rustc_codegen_ssa::{CodegenResults, CompiledModule, ModuleKind};
-
-    pub use cranelift_codegen::Context;
-    pub use cranelift_codegen::entity::EntitySet;
-    pub use cranelift_codegen::ir::{AbiParam, Block, ExternalName, FuncRef, Inst, InstBuilder, MemFlags, Signature, SourceLoc, StackSlot, StackSlotData, StackSlotKind, TrapCode, Type, Value};
-    pub use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-    pub use cranelift_codegen::ir::function::Function;
-    pub use cranelift_codegen::ir::immediates::{Ieee32, Ieee64};
-    pub use cranelift_codegen::ir::types;
-    pub use cranelift_codegen::isa::{self, CallConv};
-    pub use cranelift_codegen::settings::{self, Configurable};
-    pub use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
-    pub use cranelift_module::{
-        self, Backend, DataContext, DataId, FuncId, FuncOrDataId, Linkage, Module,
-    };
-
-    pub use crate::abi::*;
-    pub use crate::base::{trans_operand, trans_place};
-    pub use crate::cast::*;
-    pub use crate::common::*;
-    pub use crate::debuginfo::{DebugContext, FunctionDebugContext};
-    pub use crate::pointer::Pointer;
-    pub use crate::trap::*;
-    pub use crate::value_and_place::{CPlace, CPlaceInner, CValue};
-    pub use crate::CodegenCx;
-
-    pub struct PrintOnPanic<F: Fn() -> String>(pub F);
-    impl<F: Fn() -> String> Drop for PrintOnPanic<F> {
-        fn drop(&mut self) {
-            if ::std::thread::panicking() {
-                println!("{}", (self.0)());
-            }
+struct PrintOnPanic<F: Fn() -> String>(F);
+impl<F: Fn() -> String> Drop for PrintOnPanic<F> {
+    fn drop(&mut self) {
+        if ::std::thread::panicking() {
+            println!("{}", (self.0)());
         }
     }
-
-    pub macro unimpl_fatal($tcx:expr, $span:expr, $($tt:tt)*) {
-        $tcx.sess.span_fatal($span, &format!($($tt)*));
-    }
 }
 
-pub struct CodegenCx<'clif, 'tcx, B: Backend + 'static> {
-    tcx: TyCtxt<'tcx>,
-    module: &'clif mut Module<B>,
-    constants_cx: ConstantCx,
-    cached_context: Context,
-    vtables: HashMap<(Ty<'tcx>, Option<ty::PolyExistentialTraitRef<'tcx>>), DataId>,
-    debug_context: Option<&'clif mut DebugContext<'tcx>>,
+pub struct CraneliftCodegenBackend {
+    pub config: Option<BackendConfig>,
 }
-
-impl<'clif, 'tcx, B: Backend + 'static> CodegenCx<'clif, 'tcx, B> {
-    fn new(
-        tcx: TyCtxt<'tcx>,
-        module: &'clif mut Module<B>,
-        debug_context: Option<&'clif mut DebugContext<'tcx>>,
-    ) -> Self {
-        CodegenCx {
-            tcx,
-            module,
-            constants_cx: ConstantCx::default(),
-            cached_context: Context::new(),
-            vtables: HashMap::new(),
-            debug_context,
-        }
-    }
-
-    fn finalize(self) {
-        self.constants_cx.finalize(self.tcx, self.module);
-    }
-}
-
-struct CraneliftCodegenBackend;
 
 impl CodegenBackend for CraneliftCodegenBackend {
+    fn locale_resource(&self) -> &'static str {
+        // FIXME(rust-lang/rust#100717) - cranelift codegen backend is not yet translated
+        ""
+    }
+
     fn init(&self, sess: &Session) {
-        if sess.lto() != rustc_session::config::Lto::No {
-            sess.warn("LTO is not supported. You may get a linker error.");
+        use rustc_session::config::{InstrumentCoverage, Lto};
+        match sess.lto() {
+            Lto::No | Lto::ThinLocal => {}
+            Lto::Thin | Lto::Fat => {
+                sess.dcx().warn("LTO is not supported. You may get a linker error.")
+            }
+        }
+
+        if sess.opts.cg.instrument_coverage() != InstrumentCoverage::No {
+            sess.dcx()
+                .fatal("`-Cinstrument-coverage` is LLVM specific and not supported by Cranelift");
         }
     }
 
-    fn metadata_loader(&self) -> Box<dyn MetadataLoader + Sync> {
-        Box::new(crate::metadata::CraneliftMetadataLoader)
-    }
-
-    fn provide(&self, providers: &mut Providers) {
-        providers.target_features_whitelist = |tcx, cnum| {
-            assert_eq!(cnum, LOCAL_CRATE);
-            if tcx.sess.opts.actually_rustdoc {
-                // rustdoc needs to be able to document functions that use all the features, so
-                // whitelist them all
-                tcx.arena.alloc(
-                    target_features_whitelist::all_known_features()
-                        .map(|(a, b)| (a.to_string(), b))
-                        .collect(),
-                )
-            } else {
-                tcx.arena.alloc(
-                    target_features_whitelist::target_feature_whitelist(tcx.sess)
-                        .iter()
-                        .map(|&(a, b)| (a.to_string(), b))
-                        .collect(),
-                )
+    fn target_config(&self, sess: &Session) -> TargetConfig {
+        // FIXME return the actually used target features. this is necessary for #[cfg(target_feature)]
+        let target_features = if sess.target.arch == "x86_64" && sess.target.os != "none" {
+            // x86_64 mandates SSE2 support and rustc requires the x87 feature to be enabled
+            vec![sym::fxsr, sym::sse, sym::sse2, Symbol::intern("x87")]
+        } else if sess.target.arch == "aarch64" {
+            match &*sess.target.os {
+                "none" => vec![],
+                // On macOS the aes, sha2 and sha3 features are enabled by default and ring
+                // fails to compile on macOS when they are not present.
+                "macos" => vec![sym::neon, sym::aes, sym::sha2, sym::sha3],
+                // AArch64 mandates Neon support
+                _ => vec![sym::neon],
             }
+        } else {
+            vec![]
         };
+        // FIXME do `unstable_target_features` properly
+        let unstable_target_features = target_features.clone();
+
+        // FIXME(f16_f128): LLVM 20 (currently used by `rustc`) passes `f128` in XMM registers on
+        // Windows, whereas LLVM 21+ and Cranelift pass it indirectly. This means that `f128` won't
+        // work when linking against a LLVM-built sysroot.
+        let has_reliable_f128 = !sess.target.is_like_windows;
+        let has_reliable_f16 = match &*sess.target.arch {
+            // FIXME(f16_f128): LLVM 20 does not support `f16` on s390x, meaning the required
+            // builtins are not available in `compiler-builtins`.
+            "s390x" => false,
+            // FIXME(f16_f128): `rustc_codegen_llvm` currently disables support on Windows GNU
+            // targets due to GCC using a different ABI than LLVM. Therefore `f16` won't be
+            // available when using a LLVM-built sysroot.
+            "x86_64"
+                if sess.target.os == "windows"
+                    && sess.target.env == "gnu"
+                    && sess.target.abi != "llvm" =>
+            {
+                false
+            }
+            _ => true,
+        };
+
+        TargetConfig {
+            target_features,
+            unstable_target_features,
+            // `rustc_codegen_cranelift` polyfills functionality not yet
+            // available in Cranelift.
+            has_reliable_f16,
+            has_reliable_f16_math: has_reliable_f16,
+            has_reliable_f128,
+            has_reliable_f128_math: has_reliable_f128,
+        }
     }
-    fn provide_extern(&self, _providers: &mut Providers) {}
 
-    fn codegen_crate<'tcx>(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        metadata: EncodedMetadata,
-        need_metadata_module: bool,
-    ) -> Box<dyn Any> {
-        rustc_codegen_utils::check_for_rustc_errors_attr(tcx);
+    fn print_version(&self) {
+        println!("Cranelift version: {}", cranelift_codegen::VERSION);
+    }
 
-        let res = driver::codegen_crate(tcx, metadata, need_metadata_module);
+    fn codegen_crate(&self, tcx: TyCtxt<'_>) -> Box<dyn Any> {
+        info!("codegen crate {}", tcx.crate_name(LOCAL_CRATE));
+        let config = self.config.clone().unwrap_or_else(|| {
+            BackendConfig::from_opts(&tcx.sess.opts.cg.llvm_args)
+                .unwrap_or_else(|err| tcx.sess.dcx().fatal(err))
+        });
+        if config.jit_mode {
+            #[cfg(feature = "jit")]
+            driver::jit::run_jit(tcx, config.jit_args);
 
-        rustc_incremental::assert_module_sources::assert_module_sources(tcx);
-        rustc_codegen_utils::symbol_names_test::report_symbol_names(tcx);
-
-        res
+            #[cfg(not(feature = "jit"))]
+            tcx.dcx().fatal("jit support was disabled when compiling rustc_codegen_cranelift");
+        } else {
+            driver::aot::run_aot(tcx)
+        }
     }
 
     fn join_codegen(
         &self,
         ongoing_codegen: Box<dyn Any>,
         sess: &Session,
-        dep_graph: &DepGraph,
-    ) -> Result<Box<dyn Any>, ErrorReported> {
-        let (codegen_results, work_products) = *ongoing_codegen.downcast::<(CodegenResults, FxHashMap<WorkProductId, WorkProduct>)>().unwrap();
-
-        sess.time("serialize_work_products", move || {
-            rustc_incremental::save_work_product_index(sess, &dep_graph, work_products)
-        });
-
-        Ok(Box::new(codegen_results))
-    }
-
-    fn link(
-        &self,
-        sess: &Session,
-        res: Box<dyn Any>,
         outputs: &OutputFilenames,
-    ) -> Result<(), ErrorReported> {
-        use rustc_codegen_ssa::back::link::link_binary;
-
-        let codegen_results = *res
-            .downcast::<CodegenResults>()
-            .expect("Expected CraneliftCodegenBackend's CodegenResult, found Box<Any>");
-
-        let _timer = sess.prof.generic_activity("link_crate");
-
-        sess.time("linking", || {
-            let target_cpu = crate::target_triple(sess).to_string();
-            link_binary::<crate::archive::ArArchiveBuilder<'_>>(
-                sess,
-                &codegen_results,
-                outputs,
-                &codegen_results.crate_name.as_str(),
-                &target_cpu,
-            );
-        });
-
-        rustc_incremental::finalize_session_directory(sess, codegen_results.crate_hash);
-
-        Ok(())
+    ) -> (CodegenResults, FxIndexMap<WorkProductId, WorkProduct>) {
+        ongoing_codegen.downcast::<driver::aot::OngoingCodegen>().unwrap().join(sess, outputs)
     }
+}
+
+/// Determine if the Cranelift ir verifier should run.
+///
+/// Returns true when `-Zverify-llvm-ir` is passed, the `CG_CLIF_ENABLE_VERIFIER` env var is set to
+/// 1 or when cg_clif is compiled with debug assertions enabled or false otherwise.
+fn enable_verifier(sess: &Session) -> bool {
+    sess.verify_llvm_ir()
+        || cfg!(debug_assertions)
+        || env::var("CG_CLIF_ENABLE_VERIFIER").as_deref() == Ok("1")
 }
 
 fn target_triple(sess: &Session) -> target_lexicon::Triple {
-    sess.target.target.llvm_target.parse().unwrap()
+    match sess.target.llvm_target.parse() {
+        Ok(triple) => triple,
+        Err(err) => sess.dcx().fatal(format!("target not recognized: {}", err)),
+    }
 }
 
-fn build_isa(sess: &Session, enable_pic: bool) -> Box<dyn isa::TargetIsa + 'static> {
+fn build_isa(sess: &Session, jit: bool) -> Arc<dyn TargetIsa + 'static> {
     use target_lexicon::BinaryFormat;
 
     let target_triple = crate::target_triple(sess);
 
     let mut flags_builder = settings::builder();
-    if enable_pic {
-        flags_builder.enable("is_pic").unwrap();
-    } else {
-        flags_builder.set("is_pic", "false").unwrap();
-    }
-    flags_builder.set("enable_probestack", "false").unwrap(); // __cranelift_probestack is not provided
+    flags_builder.set("is_pic", if jit { "false" } else { "true" }).unwrap();
+    let enable_verifier = if enable_verifier(sess) { "true" } else { "false" };
+    flags_builder.set("enable_verifier", enable_verifier).unwrap();
+    flags_builder.set("regalloc_checker", enable_verifier).unwrap();
+
+    let mut frame_ptr = sess.target.options.frame_pointer.clone();
+    frame_ptr.ratchet(sess.opts.cg.force_frame_pointers);
+    let preserve_frame_pointer = frame_ptr != rustc_target::spec::FramePointer::MayOmit;
     flags_builder
-        .set(
-            "enable_verifier",
-            if cfg!(debug_assertions) {
-                "true"
-            } else {
-                "false"
-            },
-        )
+        .set("preserve_frame_pointers", if preserve_frame_pointer { "true" } else { "false" })
         .unwrap();
 
     let tls_model = match target_triple.binary_format {
@@ -294,30 +275,89 @@ fn build_isa(sess: &Session, enable_pic: bool) -> Box<dyn isa::TargetIsa + 'stat
     };
     flags_builder.set("tls_model", tls_model).unwrap();
 
-    // FIXME(CraneStation/cranelift#732) fix LICM in presence of jump tables
-    /*
-    use rustc::session::config::OptLevel;
+    flags_builder.set("enable_llvm_abi_extensions", "true").unwrap();
+
+    if let Some(align) = sess.opts.unstable_opts.min_function_alignment {
+        flags_builder
+            .set("log2_min_function_alignment", &align.bytes().ilog2().to_string())
+            .unwrap();
+    }
+
+    use rustc_session::config::OptLevel;
     match sess.opts.optimize {
         OptLevel::No => {
-            flags_builder.set("opt_level", "fastest").unwrap();
+            flags_builder.set("opt_level", "none").unwrap();
         }
-        OptLevel::Less | OptLevel::Default => {}
-        OptLevel::Aggressive => {
-            flags_builder.set("opt_level", "best").unwrap();
+        OptLevel::Less
+        | OptLevel::More
+        | OptLevel::Size
+        | OptLevel::SizeMin
+        | OptLevel::Aggressive => {
+            flags_builder.set("opt_level", "speed_and_size").unwrap();
         }
-        OptLevel::Size | OptLevel::SizeMin => {
-            sess.warn("Optimizing for size is not supported. Just ignoring the request");
-        }
-    }*/
+    }
+
+    if let target_lexicon::OperatingSystem::Windows = target_triple.operating_system {
+        // FIXME remove dependency on this from the Rust ABI. cc bytecodealliance/wasmtime#9510
+        flags_builder.enable("enable_multi_ret_implicit_sret").unwrap();
+    }
+
+    if let target_lexicon::Architecture::S390x = target_triple.architecture {
+        // FIXME remove dependency on this from the Rust ABI. cc bytecodealliance/wasmtime#9510
+        flags_builder.enable("enable_multi_ret_implicit_sret").unwrap();
+    }
+
+    if let target_lexicon::Architecture::Aarch64(_)
+    | target_lexicon::Architecture::Riscv64(_)
+    | target_lexicon::Architecture::X86_64 = target_triple.architecture
+    {
+        // Windows depends on stack probes to grow the committed part of the stack.
+        // On other platforms it helps prevents stack smashing.
+        flags_builder.enable("enable_probestack").unwrap();
+        flags_builder.set("probestack_strategy", "inline").unwrap();
+    } else {
+        // __cranelift_probestack is not provided and inline stack probes are only supported on
+        // AArch64, Riscv64 and x86_64.
+        flags_builder.set("enable_probestack", "false").unwrap();
+    }
 
     let flags = settings::Flags::new(flags_builder);
-    cranelift_codegen::isa::lookup(target_triple)
-        .unwrap()
-        .finish(flags)
+
+    let isa_builder = match sess.opts.cg.target_cpu.as_deref() {
+        Some("native") => cranelift_native::builder_with_options(true).unwrap(),
+        Some(value) => {
+            let mut builder =
+                cranelift_codegen::isa::lookup(target_triple.clone()).unwrap_or_else(|err| {
+                    sess.dcx().fatal(format!("can't compile for {}: {}", target_triple, err));
+                });
+            if builder.enable(value).is_err() {
+                sess.dcx()
+                    .fatal("the specified target cpu isn't currently supported by Cranelift.");
+            }
+            builder
+        }
+        None => {
+            let mut builder =
+                cranelift_codegen::isa::lookup(target_triple.clone()).unwrap_or_else(|err| {
+                    sess.dcx().fatal(format!("can't compile for {}: {}", target_triple, err));
+                });
+            if target_triple.architecture == target_lexicon::Architecture::X86_64 {
+                // Only set the target cpu on x86_64 as Cranelift is missing
+                // the target cpu list for most other targets.
+                builder.enable(sess.target.cpu.as_ref()).unwrap();
+            }
+            builder
+        }
+    };
+
+    match isa_builder.finish(flags) {
+        Ok(target_isa) => target_isa,
+        Err(err) => sess.dcx().fatal(format!("failed to build TargetIsa: {}", err)),
+    }
 }
 
 /// This is the entrypoint for a hot plugged rustc_codegen_cranelift
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub fn __rustc_codegen_backend() -> Box<dyn CodegenBackend> {
-    Box::new(CraneliftCodegenBackend)
+    Box::new(CraneliftCodegenBackend { config: None })
 }
